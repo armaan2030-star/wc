@@ -44,6 +44,7 @@ pub mod xuser;
 
 use crate::HleModule;
 
+#[cfg_attr(not(windows), allow(unused_mut))]
 pub(crate) fn all() -> Vec<HleModule> {
     let mut all = vec![
         kernel::module(),

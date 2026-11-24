@@ -4,6 +4,9 @@
 //! CPU address, as on the console; textures also get a host copy, and
 //! buffers a host copy when a draw reads them (`shadow`).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+// Without a Windows host, the host-side sizing and placement below has no
+// callers.
+#![cfg_attr(not(windows), allow(dead_code, unused_variables))]
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::c_void;
@@ -279,7 +282,10 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(
+                        format = f,
+                        "the host does not render to this format: 8-bit RGBA stands in"
+                    );
                 }
                 refused
             })
@@ -612,6 +618,7 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     // First: a view of no resource (a typed null view) has none.
     let host = host_resource(this)?;
@@ -1281,7 +1288,11 @@ pub(crate) fn host_waits(this: This) -> bool {
     let r = resource(this);
     r.desc.dimension != BUFFER
         && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
-        && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+        && r.host
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
 }
 
 /// The host side of title texture `this`: made now if it is not there and
@@ -1502,7 +1513,9 @@ pub(crate) fn census() -> [u64; 10] {
                     placed_filled += 1;
                     // Its first page: a texture's smallest mips lie there,
                     // and are mapped first and unmapped last.
-                    if placed_filled.is_multiple_of(EVERY) && !crate::texture::committed(r.data().cast_const(), 1) {
+                    if placed_filled.is_multiple_of(EVERY)
+                        && !crate::texture::committed(r.data().cast_const(), 1)
+                    {
                         count[8] += host.bytes * EVERY;
                         if crate::host::references(&host.texture) > 1 {
                             count[9] += host.bytes * EVERY;
@@ -1534,13 +1547,18 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
     // SAFETY: plain queries on a live resource and device.
     unsafe {
         let desc = texture.GetDesc();
-        host.device.GetResourceAllocationInfo(0, &[desc]).SizeInBytes
+        host.device
+            .GetResourceAllocationInfo(0, &[desc])
+            .SizeInBytes
     }
 }
 
 #[cfg(windows)]
 impl HostTexture {
-    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+    fn new(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+    ) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
@@ -1571,7 +1589,10 @@ impl Drop for HostTexture {
 /// (never released), for the memory line.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_textures() -> u64 {
-    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
+    PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len() as u64
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -1696,7 +1717,10 @@ fn host_texture(
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!(
+                "texture {}x{} f{} flags {:#x}",
+                d.width, d.height, d.format, d.flags
+            )
         });
     }
     texture

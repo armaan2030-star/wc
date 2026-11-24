@@ -172,7 +172,9 @@ static VTABLE: Methods<8> = Methods([
     prompt_result as *const (),    // 0x38
 ]);
 
-#[cfg(test)]
+// The one test below needs the Windows drive mount (`files::mount`) to
+// answer the path calls.
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;

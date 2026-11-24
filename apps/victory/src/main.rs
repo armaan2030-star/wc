@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -146,6 +147,7 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        #[cfg(windows)]
         Command::Translate {
             paths,
             validate,
@@ -154,15 +156,24 @@ fn main() -> Result<()> {
             jobs,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
-            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 victory_shader::emit::set_host_max_wave(n);
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        // Emitting DXIL ends in the host's D3D compiler and validator.
+        #[cfg(not(windows))]
+        Command::Translate { .. } => anyhow::bail!("shader translation requires Windows"),
         Command::Run {
             exe,
             unimplemented,

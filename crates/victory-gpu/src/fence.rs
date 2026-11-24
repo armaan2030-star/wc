@@ -155,6 +155,8 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(test)]
 mod tests {
+    #![cfg_attr(not(windows), allow(unused_imports))]
+
     use super::*;
     use crate::object::slot;
 
