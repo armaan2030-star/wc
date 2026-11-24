@@ -625,7 +625,7 @@ impl<'a> Tracer<'a> {
     fn runtime_table(&self, reg: Reg) -> bool {
         let first = self.stage.user_sgpr(crate::merged::RUNTIME_TABLE);
         self.merged
-            && self.stage == HwStage::Gs
+            && matches!(self.stage, HwStage::Gs | HwStage::Es)
             && reg == Reg::S(first)
             && self.param_of(reg).is_none()
             && self.param_of(Reg::S(first + 1)).is_none()
@@ -2461,7 +2461,7 @@ pub(crate) mod tests {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
         // (a geometry program is the merged stage's, with the layout of both halves)
-        let track = if stage == HwStage::Gs { track_merged } else { track };
+        let track = if matches!(stage, HwStage::Gs | HwStage::Es) { track_merged } else { track };
         track(&p, layout, stage, lanes(&p).as_ref()).unwrap()
     }
 
@@ -3931,7 +3931,7 @@ pub(crate) mod tests {
     fn track_error(words: &[u32], layout: &[RootParam], stage: HwStage) -> ShaderError {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
-        let track = if stage == HwStage::Gs { track_merged } else { track };
+        let track = if matches!(stage, HwStage::Gs | HwStage::Es) { track_merged } else { track };
         track(&p, layout, stage, lanes(&p).as_ref()).unwrap_err()
     }
 
@@ -3961,9 +3961,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_runtime_table_is_geometry_only_and_gives_way_to_the_layout() {
+    fn the_runtime_table_is_for_the_merged_stage_and_gives_way_to_the_layout() {
         // The same load in any other stage still fails: s8 is no parameter.
-        for stage in [HwStage::Vs, HwStage::Ps, HwStage::Ms, HwStage::Es] {
+        for stage in [HwStage::Vs, HwStage::Ps, HwStage::Ms] {
             let err = track_error(&load_b8(8), &[], stage);
             assert!(
                 matches!(err, ShaderError::Unsupported { what, .. } if what == NO_ROOT_WHAT),
@@ -3975,6 +3975,18 @@ pub(crate) mod tests {
         assert_eq!(r.scalar, [((0, 0), at(0, 0xB8))]);
         // A parameter on either dword takes the pair away.
         let err = track_error(&load_b8(8), &[param(Constants, 1, 1)], HwStage::Gs);
+        assert!(matches!(err, ShaderError::Unsupported { .. }), "{err:?}");
+    }
+
+    /// The ES and GS halves run on one wave and share its SGPRs, so the
+    /// pointer is in the same two registers when the ES half loads from it.
+    /// Whether the title's ES programs do is not known: this only keeps one
+    /// from failing on it where the GS half does not.
+    #[test]
+    fn the_es_half_sees_the_same_runtime_table() {
+        let r = track_words(&load_b8(8), &[], HwStage::Es);
+        assert_eq!(r.scalar, [((0, 0), at(RUNTIME_TABLE, 0xB8))]);
+        let err = track_error(&load_b8(8), &[param(Constants, 1, 1)], HwStage::Es);
         assert!(matches!(err, ShaderError::Unsupported { .. }), "{err:?}");
     }
 

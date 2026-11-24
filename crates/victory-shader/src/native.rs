@@ -64,8 +64,9 @@
 //! Merged stages keep their stage data in another layout (not read). A
 //! geometry shader is one: the console links the ES program (in the vertex
 //! container) and the GS program (in the geometry container) into one merged
-//! stage ([`crate::merged`]). The GS record is read as far as the common
-//! record goes (code, root layout, used resources); its stage data is not.
+//! stage ([`crate::merged`]). Their records are read as far as the common
+//! record goes (code, root layout, used resources, LDS bytes: [`MergedIo`]);
+//! their stage data is not.
 //!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
@@ -272,11 +273,24 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
-    /// The GS half of a merged ES+GS stage. Its stage data is not read yet
-    /// (the output signature and the LDS layout of the records the ES half
-    /// hands over are in it), so there is nothing to hold: what the program
-    /// reads on entry is [`crate::io::raise`]'s and [`crate::merged`]'s.
-    Gs,
+    /// The ES half of a merged ES+GS stage (the vertex container's program
+    /// that is not the hardware VS).
+    Es(MergedIo),
+    /// The GS half of a merged ES+GS stage. What the program reads on entry
+    /// is [`crate::io::raise`]'s and [`crate::merged`]'s.
+    Gs(MergedIo),
+}
+
+/// What the record of either half of a merged ES+GS stage ([`crate::merged`])
+/// holds that is read. The stage data after the record (output signature
+/// rows, limits) is in a layout nothing here has a fixture for, so it is not
+/// read: [`crate::merged::limits`] takes the limits from the code, and the
+/// output rows come from the container's signature part.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MergedIo {
+    /// LDS bytes the stage allocates (the ES records and the GS output
+    /// records live in it), from the common record ([`RECORD_LDS`]).
+    pub lds_bytes: u32,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -547,7 +561,15 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
-            HwStage::Gs => StageIo::Gs,
+            HwStage::Es | HwStage::Gs => {
+                let io = MergedIo {
+                    lds_bytes: u32_at(record, RECORD_LDS)?,
+                };
+                match stage {
+                    HwStage::Es => StageIo::Es(io),
+                    _ => StageIo::Gs(io),
+                }
+            }
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -711,6 +733,11 @@ pub(crate) mod tests {
 
     /// FSSM blob with `programs` as (stage, code) pairs.
     fn fssm(programs: &[(HwStage, &[u8])]) -> Vec<u8> {
+        fssm_lds(programs, 0)
+    }
+
+    /// [`fssm`] with every record's LDS byte count set.
+    pub(crate) fn fssm_lds(programs: &[(HwStage, &[u8])], lds: u32) -> Vec<u8> {
         let mut payload = GRAPHICS_SLOT_COUNT.to_le_bytes().to_vec();
         payload.resize(slot(HwStage::Cs) + 8, 0);
         for (_, at) in SLOTS {
@@ -726,7 +753,8 @@ pub(crate) mod tests {
             let flags = if stage == HwStage::Ps { FLAG_WAVE32 } else { 0 };
             payload.extend_from_slice(&[0; 4]);
             payload.extend_from_slice(&flags.to_le_bytes());
-            payload.resize(record as usize + RECORD_REGS, 0);
+            payload.resize(record as usize + RECORD_LDS, 0);
+            payload.extend_from_slice(&lds.to_le_bytes());
             payload.extend_from_slice(&(VGPRS | 31 << 20).to_le_bytes());
             payload.extend_from_slice(&empty_stage_data());
             payload.extend_from_slice(code);
@@ -770,20 +798,28 @@ pub(crate) mod tests {
     /// A shader container whose `DXIL` part holds one native blob with the
     /// given programs (stage and code), as the title's containers do.
     pub(crate) fn container(programs: &[(HwStage, &[u8])]) -> Vec<u8> {
-        let data = part(&[(KIND_NATIVE, &xbch(&fssm(programs)))]);
+        container_lds(programs, 0)
+    }
+
+    /// [`container`] whose records say they allocate `lds` bytes of LDS.
+    pub(crate) fn container_lds(programs: &[(HwStage, &[u8])], lds: u32) -> Vec<u8> {
+        let data = part(&[(KIND_NATIVE, &xbch(&fssm_lds(programs, lds)))]);
         crate::dxbc::build(&[(crate::dxbc::FourCC::DXIL, &data)])
     }
 
     #[test]
-    fn a_geometry_program_has_its_own_io_and_its_es_half_none() {
+    fn the_halves_of_a_merged_stage_carry_their_lds_size() {
         // The two halves are in different containers: ES next to the VS
-        // (here alone), GS by itself.
-        let es = native_programs(&part(&[(KIND_NATIVE, &xbch(&fssm(&[(HwStage::Es, &VS_CODE)])))]))
-            .unwrap();
-        let gs = native_programs(&part(&[(KIND_NATIVE, &xbch(&fssm(&[(HwStage::Gs, &VS_CODE)])))]))
-            .unwrap();
-        assert_eq!((es[0].stage, &es[0].io), (HwStage::Es, &StageIo::None));
-        assert_eq!((gs[0].stage, &gs[0].io), (HwStage::Gs, &StageIo::Gs));
+        // (here alone), GS by itself. The LDS size is the common record's.
+        let read = |stage, lds| {
+            let blob = xbch(&fssm_lds(&[(stage, &VS_CODE)], lds));
+            native_programs(&part(&[(KIND_NATIVE, &blob)])).unwrap().remove(0)
+        };
+        let (es, gs) = (read(HwStage::Es, 0x3000), read(HwStage::Gs, 0x2800));
+        assert_eq!((es.stage, &es.io), (HwStage::Es, &StageIo::Es(MergedIo { lds_bytes: 0x3000 })));
+        assert_eq!((gs.stage, &gs.io), (HwStage::Gs, &StageIo::Gs(MergedIo { lds_bytes: 0x2800 })));
+        // A record that allocates none says so.
+        assert_eq!(read(HwStage::Gs, 0).io, StageIo::Gs(MergedIo::default()));
         // Both are merged stages: user data starts after the 8 system SGPRs.
         assert_eq!(HwStage::Gs.user_sgpr(0), 8);
         assert_eq!(HwStage::Es.user_sgpr(0), 8);

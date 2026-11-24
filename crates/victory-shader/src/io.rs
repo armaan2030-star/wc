@@ -306,10 +306,11 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             ];
             (loaded, &[][..], &ms.outputs[..])
         }
-        // The GS half of a merged ES+GS stage: no exports (its output goes
-        // through LDS, not modeled yet); the runtime table pointer is the one
-        // input known. The root layout wins where it covers those dwords.
-        (StageIo::Gs, HwStage::Gs) => {
+        // The halves of a merged ES+GS stage share the SGPRs: no exports (the
+        // ES half hands its records over through LDS, the GS half writes its
+        // output vertices there); the runtime table pointer is the one input
+        // known. The root layout wins where it covers those dwords.
+        (StageIo::Gs(_), HwStage::Gs) | (StageIo::Es(_), HwStage::Es) => {
             let first = native.stage.user_sgpr(crate::merged::RUNTIME_TABLE);
             let taken = native.layout.iter().any(|p| {
                 let at = u32::from(native.stage.user_sgpr(p.user_data));
@@ -850,7 +851,7 @@ mod tests {
             vgprs: 256,
             layout,
             used: vec![],
-            io: StageIo::Gs,
+            io: StageIo::Gs(Default::default()),
             code: vec![],
         }
     }

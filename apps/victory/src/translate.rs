@@ -75,6 +75,10 @@ struct Tally {
     gs_programs: usize,
     gs_tracked: usize,
     gs_raised: usize,
+    /// Geometry programs whose emitted vertices are bounded in the code, and
+    /// the largest bound ([`victory_shader::merged::limits`]).
+    gs_bounded: usize,
+    gs_max_vertices: u32,
     gs_stopped: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
@@ -140,6 +144,8 @@ impl Tally {
         self.gs_programs += other.gs_programs;
         self.gs_tracked += other.gs_tracked;
         self.gs_raised += other.gs_raised;
+        self.gs_bounded += other.gs_bounded;
+        self.gs_max_vertices = self.gs_max_vertices.max(other.gs_max_vertices);
         self.gs_stopped += other.gs_stopped;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
@@ -426,6 +432,10 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let lanes = structured.as_ref().ok();
                 let geometry = p.stage == HwStage::Gs;
                 t.gs_programs += usize::from(geometry);
+                if geometry && let Ok(l) = victory_shader::merged::limits(&program) {
+                    t.gs_bounded += 1;
+                    t.gs_max_vertices = t.gs_max_vertices.max(l.max_vertices);
+                }
                 // (the ES half each geometry program pairs with is not in
                 // its container: its user data 0 and 1 are taken as free, which
                 // the geometry line says)
