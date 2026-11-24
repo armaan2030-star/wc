@@ -42,6 +42,8 @@ walkdir = "2.5.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
 opus-pure = "0.2.4"
+# Verifies the DirectX 12 Agility SDK redistributable download (xtask agility-sdk).
+sha2 = "0.10.9"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

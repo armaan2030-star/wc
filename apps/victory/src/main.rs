@@ -14,6 +14,25 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// A raw pointer, exported as a `static`: `*const u8` alone is not `Sync`,
+/// but the pointee here is a `'static` byte-string literal in read-only
+/// memory, so sharing the address across threads is sound.
+#[repr(transparent)]
+pub struct ReadOnlyCStr(*const u8);
+// SAFETY: points at a 'static byte-string literal; never written to.
+unsafe impl Sync for ReadOnlyCStr {}
+
+/// Tells `D3D12CreateDevice` which DirectX 12 Agility SDK core to use, if
+/// `.\D3D12\D3D12Core.dll` is present next to this exe (see build.rs and
+/// `cargo xtask agility-sdk`); otherwise it falls back to the OS's own
+/// `d3d12.dll`. Must match `D3D12_SDK_VERSION` in the fetched headers
+/// (xtask/src/agility.rs::SDK_VERSION).
+#[unsafe(no_mangle)]
+pub static D3D12SDKVersion: u32 = 620;
+/// The directory `D3D12SDKVersion` is read from, relative to this exe.
+#[unsafe(no_mangle)]
+pub static D3D12SDKPath: ReadOnlyCStr = ReadOnlyCStr(c".\\D3D12\\".as_ptr().cast());
+
 #[derive(Parser)]
 #[command(
     name = "victory",
