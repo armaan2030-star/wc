@@ -1575,6 +1575,7 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
+        let memory = crate::host::host().and_then(|h| h.video_memory());
         // `VICTORY_TEXTURE_STAGE_MB` overrides the auto-scaled per-frame staging
         // budget: a backlog of tens of thousands of textures (a scene's first
         // minutes) then drains in fewer frames.
@@ -1586,13 +1587,7 @@ impl State {
                     .and_then(|v| v.trim().parse().ok())
             })
             .map_or_else(
-                || {
-                    staging_budget_per_frame(
-                        crate::host::host()
-                            .and_then(|h| h.video_memory())
-                            .map(|[budget, ..]| budget),
-                    )
-                },
+                || staging_budget_per_frame(memory.map(|[budget, ..]| budget)),
                 |mb| mb.saturating_mul(1 << 20),
             );
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -1608,7 +1603,7 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let room = crate::resource::room();
+        let room = crate::resource::room(memory);
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
@@ -2922,7 +2917,7 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
     match vram_budget {
         Some(budget) if budget <= 6 * GIB => 96 * MIB,
         Some(budget) if budget >= 20 * GIB => 384 * MIB,
-        Some(budget) if budget > 14 * GIB => 256 * MIB,
+        Some(budget) if budget > 12 * GIB => 256 * MIB,
         _ => 192 * MIB,
     }
 }
@@ -2940,7 +2935,8 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(6 * GIB)), 96 * MIB);
         assert_eq!(staging_budget_per_frame(Some(8 * GIB)), 192 * MIB);
         assert_eq!(staging_budget_per_frame(Some(12 * GIB)), 192 * MIB);
-        assert_eq!(staging_budget_per_frame(Some(14 * GIB)), 192 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(13 * GIB)), 256 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(14 * GIB)), 256 * MIB);
         assert_eq!(staging_budget_per_frame(Some(16 * GIB)), 256 * MIB);
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
