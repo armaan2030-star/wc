@@ -71,6 +71,33 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Acquires a reference without reviving an object whose last owner released it.
+///
+/// # Safety
+/// The caller must keep the allocation valid even when the count is zero.
+#[cfg(windows)]
+pub(crate) unsafe fn retain_live(this: This) -> bool {
+    // SAFETY: the caller keeps the allocation valid.
+    unsafe { &*this }
+        .refs
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            if n == 0 { None } else { n.checked_add(1) }
+        })
+        .is_ok()
+}
+
+/// Releases a retained reference through the object's own destruction path.
+///
+/// # Safety
+/// The caller owns a reference to the object.
+#[cfg(windows)]
+pub(crate) unsafe fn release_live(this: This) {
+    // SAFETY: all our COM tables put Release in slot 2.
+    let f = unsafe { *(*this).functions.add(2) };
+    let release: extern "system" fn(This) -> u32 = unsafe { std::mem::transmute(f) };
+    release(this);
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;

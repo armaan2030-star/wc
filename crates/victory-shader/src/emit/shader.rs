@@ -27,6 +27,16 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
+/// A raw root SRV containing the guest image dimensions by global view slot.
+/// Each dword packs width minus one and height minus one at mip zero into
+/// 14 bits each, followed by the four-bit base mip of the view.
+pub const SLOT_IMAGE_DIMS: u8 = 252;
+/// Dwords of the [`SLOT_IMAGE_DIMS`] table.
+pub const SLOT_IMAGE_DIMS_COUNT: u32 = 1 << 21;
+/// A slot that does not contain a supported image view. A 16,384-texel
+/// resource has at most 15 mips, so base mip 15 cannot be a valid view.
+pub const SLOT_IMAGE_DIMS_INVALID: u32 = u32::MAX;
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the
