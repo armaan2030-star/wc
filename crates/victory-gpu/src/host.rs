@@ -1564,6 +1564,8 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
+    /// Work that writes host memory only, reading title memory `(address, bytes)`.
+    HostRead(usize, usize, Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -1825,7 +1827,7 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{Step, WHY_READ, WHY_RUN, blocked_by_steps, flagged_pieces, landable};
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -1861,6 +1863,26 @@ mod relay_tests {
         assert!(!fetch.contains(&(b, 3)));
         assert!(fetch.contains(&(b, 9)));
         assert_eq!(fetch.len(), 2);
+    }
+
+    /// `Step::HostRead` (used by `expand_rects`) is checked against pending
+    /// shader writes, and a later `Step::Run` takes precedence over an earlier
+    /// `WHY_READ` so `VICTORY_RELAY=2` settles rather than waiting only on read
+    /// ranges.
+    #[test]
+    fn blocked_by_steps_checks_host_read_and_prioritizes_run() {
+        let written = [(0x2000usize, 0x3000usize)];
+        let unrelated = [Step::HostRead(0x4000, 0x100, Box::new(|| {}))];
+        assert_eq!(blocked_by_steps(&written, &unrelated), None);
+
+        let host_read = [Step::HostRead(0x2800, 0x200, Box::new(|| {}))];
+        assert_eq!(blocked_by_steps(&written, &host_read), Some((WHY_READ, Some(16))));
+
+        let read_then_run = [
+            Step::Fill(0x1000, 0x2400, 0x100),
+            Step::Run(Box::new(|| {})),
+        ];
+        assert_eq!(blocked_by_steps(&written, &read_then_run), Some((WHY_RUN, None)));
     }
 }
 
@@ -2041,6 +2063,50 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// [`blocked_by`] over one slice of steps, returning `(reason, read_stat)` with
+/// `WHY_RUN` taking precedence over an earlier `WHY_READ`.
+fn blocked_by_steps<'a>(
+    written: &[(usize, usize)],
+    steps: impl IntoIterator<Item = &'a Step>,
+) -> Option<(usize, Option<usize>)> {
+    if written.is_empty() {
+        return None;
+    }
+    let mut read_stat: Option<Option<usize>> = None;
+    for step in steps {
+        match step {
+            &Step::Copy(dst, src, len) => {
+                if read_stat.is_none()
+                    && (touches(written, src, src + len) || touches(written, dst, dst + len))
+                {
+                    read_stat = Some(Some(15));
+                }
+            }
+            &Step::Fill(_, src, len) => {
+                if read_stat.is_none() && touches(written, src, src + len) {
+                    read_stat = Some(Some(16));
+                }
+            }
+            Step::Texture(staging) => {
+                if read_stat.is_none() {
+                    let (at, len) = staging.memory();
+                    if touches(written, at, at + len) {
+                        read_stat = Some(Some(17));
+                    }
+                }
+            }
+            &Step::HostRead(src, len, _) => {
+                if read_stat.is_none() && touches(written, src, src + len) {
+                    read_stat = Some(Some(16));
+                }
+            }
+            Step::Run(_) => return Some((WHY_RUN, None)),
+            Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+        }
+    }
+    read_stat.map(|stat| (WHY_READ, stat))
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2048,38 +2114,25 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     if written.is_empty() {
         return None;
     }
+    let mut read_stat: Option<Option<usize>> = None;
     for list in runs {
-        for step in &list.deferred().copies {
-            match step {
-                &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
-                        if count {
-                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
-                }
-                &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
-                        if count {
-                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
-                }
-                Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
-                    if touches(written, at, at + len) {
-                        if count {
-                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
-                }
-                Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+        let deferred = list.deferred();
+        if let Some((why, stat)) = blocked_by_steps(written, &deferred.copies) {
+            if why == WHY_RUN {
+                return Some(WHY_RUN);
+            }
+            if read_stat.is_none() {
+                read_stat = Some(stat);
             }
         }
+    }
+    if let Some(stat) = read_stat {
+        if count
+            && let Some(slot) = stat
+        {
+            LATE_STATS[slot].fetch_add(1, Ordering::Relaxed);
+        }
+        return Some(WHY_READ);
     }
     None
 }
@@ -5063,6 +5116,15 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// As [`HostList::defer_host`], recording the title-memory range
+    /// `[src, src + len)` read by `work` so late-wait / relay waits for
+    /// in-flight writes to that range.
+    pub(crate) fn defer_host_read(&self, src: *const u8, len: usize, work: impl Fn() + Send + 'static) {
+        self.deferred()
+            .copies
+            .push(Step::HostRead(src as usize, len, Box::new(work)));
+    }
+
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
@@ -5108,7 +5170,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
+                Step::Run(work) | Step::Host(work) | Step::HostRead(_, _, work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
