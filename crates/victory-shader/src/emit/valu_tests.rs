@@ -100,6 +100,13 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+    build_test_cs(body, false, ComputeIo {
+        rsrc2: (5 << 1) | ((lds_bytes / 512) << 15),
+        threads: [threads, 1, 1],
+    }, buffer_store_dword(0, 8, 0)).0
+}
+
+fn build_test_cs(body: &[u32], wave64: bool, compute: ComputeIo, store: [u32; 2]) -> (HostShader, Option<u32>) {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -110,13 +117,13 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.extend_from_slice(&store);
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 8,
         layout: vec![
             RootParam {
@@ -146,10 +153,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
             user_data: 4,
             slot: 1,
         }],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
-            threads: [threads, 1, 1],
-        }),
+        io: StageIo::Cs(compute),
         code,
     };
 
@@ -171,6 +175,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     })
     .expect("lower");
 
+    let wave_size = lowered.wave_size;
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -190,7 +195,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         assert_eq!(copy[4..20], ours[..], "container hash mismatch");
     }
 
-    shader
+    (shader, wave_size)
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
@@ -199,6 +204,66 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
 /// WARP can end the test process with an access violation. Other GPU test
 /// modules take this lock too.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn opposite_row_permute_executes_on_wave32_hardware() {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FEATURE_DATA_D3D12_OPTIONS1, D3D12_FEATURE_D3D12_OPTIONS1};
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+        eprintln!("VICTORY_WARP=1: hardware opposite-row readback skipped");
+        return;
+    }
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device: opposite-row readback skipped");
+        return;
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the query fills the plain OPTIONS1 structure.
+    let supported = unsafe {
+        host.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut options).cast(), size_of_val(&options) as u32)
+    };
+    if supported.is_err() || !options.WaveOps.as_bool()
+        || !(options.WaveLaneCountMin..=options.WaveLaneCountMax).contains(&32)
+    {
+        eprintln!("hardware lacks 32-lane wave operations: opposite-row readback skipped");
+        return;
+    }
+    // The harness selects the default adapter; print its identity so a
+    // hardware run can be matched to the intended device.
+    unsafe {
+        if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            && let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid())
+            && let Ok(desc) = adapter.GetDesc1()
+        {
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            eprintln!("opposite-row adapter: {} (vendor {:#06x}, device {:#06x})",
+                String::from_utf16_lossy(&desc.Description[..end]), desc.VendorId, desc.DeviceId);
+        }
+    }
+
+    let body = [
+        0xd778_0002, 0x0201_0100, // v_permlanex16_b32 v2, v0, 0, 0
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0: output byte offset
+    ];
+    let previous = lower::TEST_HOST_WAVE.replace(Some(32));
+    let (shader, wave_size) = build_test_cs(
+        &body, true, ComputeIo { rsrc2: 5 << 1, threads: [64, 1, 1] },
+        [0xe070_1000, 0x8002_0204], // buffer_store_dword v2, v4, s[8:11], 0 offen
+    );
+    lower::TEST_HOST_WAVE.set(previous);
+    assert_eq!(wave_size, Some(32));
+    let (root, pso) = host.compute_pipeline(&shader).expect("opposite-row pipeline");
+    let out = host.dispatch(&root, &pso, &Dispatch {
+        roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+        views: &[View::RawUav(64)], samplers: &[], groups: [1, 1, 1],
+    }).expect("opposite-row dispatch");
+    assert_eq!(out[0].len(), 64);
+    for (lane, &actual) in out[0].iter().enumerate() {
+        assert_eq!(actual, ((lane as u32) & !15) ^ 16, "lane {lane}");
+    }
+}
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.

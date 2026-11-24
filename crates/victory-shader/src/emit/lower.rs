@@ -1262,6 +1262,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n == "v_permlanex16_b32"
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -6509,6 +6510,88 @@ impl<'a> Lower<'a> {
         Ok((r, enable))
     }
 
+    /// Full native EXEC as a paired mask on Wave64.
+    fn full_exec(&self, inst: &Inst) -> bool {
+        let high = inst.read(Reg::S(EXEC + 1));
+        high.is_some() == self.x.p.wave64
+            && inst.read(Reg::S(EXEC)).and_then(|lo| self.x.st.mask_bits(lo, high))
+                == Some(Bool::TRUE)
+    }
+
+    /// An entry-block test that every lane's comparison bit is set. Its count
+    /// comes from the full-width ballot, and on a split wave both halves get it.
+    fn entry_all_lanes_test(&self, scc: Value) -> bool {
+        let entry = &self.x.p.blocks[0].insts;
+        let Some(cmp) = entry.iter().find(|i| i.write(Reg::Scc) == Some(scc)) else {
+            return false;
+        };
+        let Fields::Sop { src, .. } = &cmp.fields else {
+            return false;
+        };
+        let [Operand::Scalar { code, .. }, Operand::Const(n)] = src.as_slice() else {
+            return false;
+        };
+        if cmp.name() != "s_cmp_eq_u32" || crate::resource::inline(*n) != Some(self.wave()) {
+            return false;
+        }
+        let Some(count) = cmp.read(Reg::S(*code)) else {
+            return false;
+        };
+        let Some(bcnt) = entry.iter().find(|i| i.write(Reg::S(*code)) == Some(count)) else {
+            return false;
+        };
+        let wave64 = self.x.p.wave64;
+        let expected = if wave64 { "s_bcnt1_i32_b64" } else { "s_bcnt1_i32_b32" };
+        if bcnt.name() != expected {
+            return false;
+        }
+        let Fields::Sop { src, .. } = &bcnt.fields else {
+            return false;
+        };
+        let [Operand::Scalar { code: mask, .. }] = src.as_slice() else {
+            return false;
+        };
+        let Some(lo) = bcnt.read(Reg::S(*mask)) else {
+            return false;
+        };
+        let hi = wave64.then(|| bcnt.read(Reg::S(*mask + 1))).flatten();
+        let st = self.x.st;
+        hi.is_some() == wave64
+            && st.active.contains(&lo)
+            && st.mask_bits(lo, hi).is_some()
+            && entry.iter().any(|i| {
+                i.name() == "v_cmp_ne_u32"
+                    && i.write(Reg::S(*mask)) == Some(lo)
+                    && (!wave64 || i.write(Reg::S(*mask + 1)) == hi)
+                    && self.full_exec(i)
+            })
+    }
+
+    /// Full native EXEC and full physical wave participation. With neither FI nor
+    /// BOUND_CTRL, an inactive source preserves the destination and an inactive
+    /// physical source cannot be read with `WaveReadLaneAt`.
+    fn opposite_row_is_live(&self, inst: &Inst) -> bool {
+        let st = self.x.st;
+        // The emitter installs loop counters for backward edges before any
+        // instructions. Exclude loops and their generated early return paths.
+        if self.local
+            || !self.counters.is_empty()
+            || !st.wide.is_empty()
+            || !matches!(self.x.native.io, StageIo::Cs(cs)
+                if cs.threads.iter().product::<u32>() == self.wave())
+            || !self.full_exec(inst)
+        {
+            return false;
+        }
+        let b = self.cur_ir;
+        let reach = st.reach[b];
+        reach != Bool::FALSE
+            && st.bools.support(reach).iter().all(|atom| {
+                matches!(*atom, Atom::Uniform(scc) if self.entry_all_lanes_test(scc))
+            })
+            && all_lane_blocks(st).is_some_and(|all| all[b])
+    }
+
     fn valu_op(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -6526,6 +6609,38 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_permlanex16_b32" => {
+                let zero = |op: &Operand| matches!(op, Operand::Const(128) | Operand::Literal(0));
+                let [Operand::Vector { .. }, lo, hi] = v.src.as_slice() else {
+                    return Err("unsupported opposite-row permutation operands");
+                };
+                if !zero(lo)
+                    || !zero(hi)
+                    || v.opsel != 0
+                    || v.abs != 0
+                    || v.neg != 0
+                    || v.omod != 0
+                    || v.clamp
+                    || v.dpp.is_some()
+                    || v.sdwa.is_some()
+                {
+                    return Err("unsupported opposite-row permutation controls");
+                }
+                if guard.is_some() || !self.opposite_row_is_live(inst) {
+                    return Err("an opposite-row permutation without full lane participation");
+                }
+                self.cross_lane(false)?;
+                let x = s(self, 0)?;
+                let lane = self.lane_index();
+                let row = self.s.m.i32(!15);
+                let other = self.s.m.i32(16);
+                let base = self.s.m.bin(c, Bin::And, lane, row);
+                let source = self.s.m.bin(c, Bin::Xor, base, other);
+                // Zero selectors read lane zero of the opposite row without
+                // crossing the enclosing 32-lane half.
+                let read = self.read_lane(x, source);
+                int(self, read)
+            }
             "v_mad_u64_u32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out
                 // of the sum is this lane's bit of the mask it names.
@@ -11095,6 +11210,90 @@ mod tests {
             0,
             "dynamic v_perm_b32 must not require INT64"
         );
+    }
+
+    #[test]
+    fn opposite_row_permute_validates_in_split_waves() {
+        let body = [
+            0xD778_0002,
+            0x0201_0100, // v_permlanex16_b32 v2, v0, 0, 0
+            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+            0xD834_0000,
+            0x0000_0204, // ds_write_b32 v4, v2
+            S_ENDPGM,
+        ];
+        let emit = |words: &[u32]| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 15,
+                    threads: [64, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, true, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+        let previous = super::TEST_HOST_WAVE.replace(Some(32));
+        let shader = emit(&body);
+        let masked = emit(&[&[0xBEFE_0481][..], &body].concat()); // s_mov_b64 exec, 1
+        let untracked = [
+            0xBE84_0481, // s_mov_b64 s[4:5], 1
+            0xBE82_1004, // s_bcnt1_i32_b64 s2, s[4:5]
+            0xBF06_C002, // s_cmp_eq_u32 s2, 64
+            0xBF84_0005, // s_cbranch_scc0 -> s_endpgm
+        ];
+        let untracked = emit(&[&untracked[..], &body].concat());
+        let controls = [1 << 11, 1 << 12, 1 << 13, 1 << 15].map(|control| {
+            let mut words = body;
+            words[0] |= control;
+            emit(&words)
+        });
+        super::TEST_HOST_WAVE.set(previous);
+        let mut shader = shader.unwrap();
+        assert_eq!(shader.wave_size, Some(32));
+        assert!(shader.wave_ops);
+        for result in [masked, untracked] {
+            assert!(matches!(
+                result,
+                Err(crate::ShaderError::Unsupported {
+                    what: "an opposite-row permutation without full lane participation",
+                    ..
+                })
+            ));
+        }
+        for result in controls {
+            assert!(matches!(
+                result,
+                Err(crate::ShaderError::Unsupported {
+                    what: "unsupported opposite-row permutation controls",
+                    ..
+                })
+            ));
+        }
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil).unwrap();
+        }
     }
 
     #[test]

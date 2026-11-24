@@ -435,7 +435,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
-            ("v_permlanex16_b32", Some(a)) => {
+            ("v_permlanex16_b32", Some(a))
+                if exec == all
+                    && v.opsel == 0
+                    && v.dpp.is_none()
+                    && matches!(v.src.first(), Some(Operand::Vector { .. })) =>
+            {
                 // Lanes of each row read the other row of their half; lane
                 // i's pick is nibble i of {src2, src1}.
                 let sel = |k: usize| match v.src.get(k) {
@@ -756,6 +761,24 @@ mod tests {
             fi: false,
         };
         assert_eq!(dpp_lane(swap, 8), Some((9, false, true)));
+    }
+
+    #[test]
+    fn opposite_row_permute_with_inactive_sources_is_not_simulated() {
+        let w = [
+            0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+            vop1(1, 0x01, 135), // v_mov_b32 v1, 7
+            vop1(2, 0x01, 128), // v_mov_b32 v2, 0
+            sop1(EXEC, 0x04, 129), // s_mov_b64 exec, 1
+            0xD778_0002,
+            0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+            0xD760_0007,
+            0x0001_0102, // v_readlane_b32 s7, v2, 0
+            sop1(EXEC, 0x04, 4), // s_mov_b64 exec, s[4:5]
+        ];
+        let p = build(&w, true);
+        let total = p.blocks[0].insts[5].write(Reg::S(7)).unwrap();
+        assert_eq!(sections(&p, 0)[&0].shapes.get(&total), None);
     }
 
     #[test]
