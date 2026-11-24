@@ -9,6 +9,7 @@ mod run;
 mod shader;
 mod translate;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -83,7 +84,7 @@ enum Command {
         list: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
-        jobs: Option<usize>,
+        jobs: Option<NonZeroUsize>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -219,4 +220,31 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn translate_rejects_zero_jobs() {
+        let err = Cli::try_parse_from(["victory", "translate", "--jobs", "0", "shader.bin"])
+            .err()
+            .expect("--jobs 0 must be rejected");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn translate_accepts_positive_jobs() {
+        let cli = Cli::try_parse_from(["victory", "translate", "--jobs", "1", "shader.bin"])
+            .expect("--jobs 1 must parse");
+        match cli.command {
+            Command::Translate { jobs, paths, .. } => {
+                assert_eq!(jobs, NonZeroUsize::new(1));
+                assert_eq!(paths, vec![PathBuf::from("shader.bin")]);
+            }
+            _ => panic!("expected Translate command"),
+        }
+    }
 }

@@ -2,6 +2,7 @@
 //! what it cannot handle yet is tallied (decision 0003).
 
 use std::collections::{BTreeMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -157,12 +158,27 @@ pub fn run(
     validate: bool,
     pipelines: bool,
     list: bool,
-    jobs: Option<usize>,
+    jobs: Option<NonZeroUsize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    let (t, pair_lines) = run_paths(&paths, validate, pipelines, list, jobs)?;
+    print_summary(t, pair_lines);
+    Ok(())
+}
+
+fn run_paths(
+    paths: &[PathBuf],
+    validate: bool,
+    pipelines: bool,
+    list: bool,
+    jobs: Option<NonZeroUsize>,
+) -> Result<(Tally, Vec<String>)> {
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
-    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
+    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         victory_shader::emit::set_host_max_wave(n);
     }
     let dll = validate.then(Validator::default_path).flatten();
@@ -184,11 +200,12 @@ pub fn run(
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = jobs
+        .or_else(|| std::thread::available_parallelism().ok())
+        .map_or(4, NonZeroUsize::get);
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
-    for root in &paths {
+    for root in paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
             .filter_map(Result::ok)
@@ -227,6 +244,29 @@ pub fn run(
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    let mut pair_lines = Vec::new();
+    if !pairs.is_empty() {
+        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        let kept = lock(&kept);
+        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
+        for (v, p) in &pairs {
+            let made = match (find(v), find(p)) {
+                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
+                    host.mesh_pipeline(vs, ps)
+                } else {
+                    host.pipeline(vs, ps)
+                }
+                .map(|_| "pipeline created".to_owned())
+                .unwrap_or_else(|e| e),
+                _ => "not emitted".to_owned(),
+            };
+            pair_lines.push(format!("pair {v} + {p}: {made}"));
+        }
+    }
+    Ok((t, pair_lines))
+}
+
+fn print_summary(t: Tally, pair_lines: Vec<String>) {
     println!(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
@@ -275,23 +315,8 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
-    if !pairs.is_empty() {
-        let host = Host::new(false).map_err(anyhow::Error::msg)?;
-        let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
-        for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                    host.mesh_pipeline(vs, ps)
-                } else {
-                    host.pipeline(vs, ps)
-                }
-                .map(|_| "pipeline created".to_owned())
-                .unwrap_or_else(|e| e),
-                _ => "not emitted".to_owned(),
-            };
-            println!("pair {v} + {p}: {made}");
-        }
+    for line in pair_lines {
+        println!("{line}");
     }
     let mut lines = t.lines;
     lines.sort();
@@ -303,7 +328,6 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
-    Ok(())
 }
 
 fn translate(
@@ -782,4 +806,78 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "victory-translate-{name}-{}-{n}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn build_dxbc(parts: &[(FourCC, &[u8])]) -> Vec<u8> {
+        let header_size = 0x20usize;
+        let table = header_size + 4 * parts.len();
+        let total = table + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(b"DXBC");
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+        let mut offset = table;
+        for (_, d) in parts {
+            out.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += 8 + d.len();
+        }
+        for (fourcc, d) in parts {
+            out.extend_from_slice(&fourcc.0);
+            out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+            out.extend_from_slice(d);
+        }
+        out
+    }
+
+    #[test]
+    fn jobs_one_processes_synthetic_container() {
+        let dir = TempDir::new("jobs-one");
+        let file = dir.0.join("synthetic.dxbc");
+        let bytes = build_dxbc(&[(FourCC::SFI0, &[1, 2, 3, 4])]);
+        std::fs::write(&file, bytes).unwrap();
+
+        let (tally, pair_lines) = run_paths(
+            std::slice::from_ref(&file),
+            false,
+            false,
+            true,
+            NonZeroUsize::new(1),
+        )
+        .unwrap();
+        assert_eq!(tally.containers, 1);
+        assert_eq!(tally.duplicates, 0);
+        assert_eq!(tally.lines.len(), 1);
+        assert!(tally.failed.contains_key("no DXIL part (SM5 or older)"));
+        assert!(pair_lines.is_empty());
+
+        run(vec![file], false, false, false, NonZeroUsize::new(1)).unwrap();
+    }
 }
