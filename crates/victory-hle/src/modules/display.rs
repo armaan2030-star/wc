@@ -5,8 +5,10 @@
 use std::ffi::{c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, text,
 };
+#[cfg(windows)]
+use super::xgameruntime::put;
 
 /// HDR mode; asked for with this interface id since 2020.
 pub const HDR_PROVIDER: Guid = Guid::new(

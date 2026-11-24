@@ -592,7 +592,8 @@ mod host {
     }
 }
 
-#[cfg(test)]
+// Every test here leans on Windows module-name and path semantics.
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

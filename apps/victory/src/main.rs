@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -146,6 +147,7 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        #[cfg(windows)]
         Command::Translate {
             paths,
             validate,
@@ -163,6 +165,9 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        // Emitting DXIL ends in the host's D3D compiler and validator.
+        #[cfg(not(windows))]
+        Command::Translate { .. } => anyhow::bail!("shader translation requires Windows"),
         Command::Run {
             exe,
             unimplemented,
@@ -191,6 +196,9 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    if let Some(v) = victory_core::platform::wine_version() {
+        println!("host        : Wine {v} (see docs/proton.md)");
+    }
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

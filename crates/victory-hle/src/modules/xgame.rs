@@ -81,10 +81,15 @@ extern "system" fn launch_new_game(
         .unwrap_or_default();
     let ours: Vec<_> = std::env::args_os().skip(1).collect();
     let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
+    #[cfg(windows)]
     super::lifecycle::end_title(
         "XLaunchNewGame",
         Box::new(move || super::lifecycle::relaunch(command)),
     );
+    // No host process to relaunch outside Windows: park, as the title is
+    // parked on the console when it relaunches itself.
+    #[cfg(not(windows))]
+    let _ = command;
     loop {
         std::thread::park();
     }

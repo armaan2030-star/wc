@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod policy;
+mod scripts;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

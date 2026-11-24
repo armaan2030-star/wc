@@ -71,6 +71,9 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+// `fetch_update` is only deprecated on toolchains newer than the pinned
+// 1.98, where `try_update` does not exist yet.
+#[allow(deprecated)]
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
@@ -128,6 +131,7 @@ pub(crate) fn hand_out<T>(
 }
 
 /// Release for objects made by [`hand_out`]: the last reference frees it.
+#[allow(deprecated)]
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;

@@ -8,14 +8,17 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-victory-core.workspace = true
 victory-pe.workspace = true
-anyhow.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
 blake3.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# Anyhow and tracing only serve the Windows-side loader modules; the
+# portable `prepare` reports through `PrepareError`.
+anyhow.workspace = true
+tracing.workspace = true
+# Only the module loader checks cache policy.
+victory-core.workspace = true
 windows-sys = { workspace = true, features = [
     "Wdk_System_Threading",
     "Win32_Foundation",

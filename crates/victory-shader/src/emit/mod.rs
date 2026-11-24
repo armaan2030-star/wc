@@ -756,6 +756,8 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    #![cfg_attr(not(windows), allow(unused_imports))]
+
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
@@ -1316,6 +1318,9 @@ mod tests {
         })
         .unwrap();
         let mut dxil = l.dxil;
+        // On a host without the DXIL validator and D3D12, nothing consumes it.
+        #[cfg(not(windows))]
+        let _ = &mut dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),

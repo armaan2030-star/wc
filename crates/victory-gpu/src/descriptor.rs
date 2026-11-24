@@ -6,6 +6,8 @@
 //! moves whole ones. Render target and depth views are ours alone; 128 bytes
 //! leaves room for whatever stride a title assumes.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+// Without a Windows host, the heap bookkeeping below has no callers.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};

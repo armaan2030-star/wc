@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod logging;
+pub mod platform;
 pub mod policy;
 
 pub use config::Config;
