@@ -279,7 +279,7 @@ fn mesh_kept(pipeline: usize) -> bool {
     let Some(at) = p.name.find("mesh ") else {
         return true;
     };
-    let hash = p.name[at + 5..].as_bytes();
+    let hash = &p.name.as_bytes()[at + 5..];
     if hash.len() < 16 {
         return true;
     }
