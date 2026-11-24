@@ -306,6 +306,23 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    match emit_forms(c, native, p, st, io, res) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::ONLY_DATA => {
+            lower::with_measured_descriptors(|| emit_forms(c, native, p, st, io, res))
+        }
+        r => r,
+    }
+}
+
+/// [`emit`]: the program, and where it is refused, its other forms.
+fn emit_forms(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
