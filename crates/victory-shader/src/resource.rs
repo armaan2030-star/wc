@@ -211,7 +211,33 @@ pub fn track(
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
-    let t = Tracer::new(p, layout, stage, lanes)?;
+    track_with(p, layout, stage, lanes, false)
+}
+
+/// [`track`] for a half of a merged ES+GS stage whose `layout` lists the
+/// root parameters of both halves ([`crate::merged::MergedGs::program`]), or
+/// is taken to (a geometry program on its own, with the ES half unknown):
+/// then the first two user-data dwords that no parameter holds are the
+/// console runtime's table pointer ([`RUNTIME_TABLE`]). Without the other
+/// half's parameters that is a guess: the ES half may own those dwords.
+pub fn track_merged(
+    p: &Program,
+    layout: &[RootParam],
+    stage: HwStage,
+    lanes: Option<&Structured>,
+) -> Result<Resources, ShaderError> {
+    track_with(p, layout, stage, lanes, true)
+}
+
+fn track_with(
+    p: &Program,
+    layout: &[RootParam],
+    stage: HwStage,
+    lanes: Option<&Structured>,
+    merged: bool,
+) -> Result<Resources, ShaderError> {
+    let mut t = Tracer::new(p, layout, stage, lanes)?;
+    t.merged = merged;
     let mut out = Resources {
         params: p
             .inputs
@@ -420,6 +446,9 @@ struct Tracer<'a> {
     rpo: Vec<usize>,
     /// The block of the access being traced ([`Self::live`]).
     at: std::cell::Cell<Option<usize>>,
+    /// The layout is the merged stage's ([`track_merged`]): the runtime
+    /// table is looked for in it.
+    merged: bool,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -487,6 +516,7 @@ impl<'a> Tracer<'a> {
             meets: Default::default(),
             rpo,
             at: Default::default(),
+            merged: false,
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -594,7 +624,8 @@ impl<'a> Tracer<'a> {
     /// program, when the root layout puts no parameter on either.
     fn runtime_table(&self, reg: Reg) -> bool {
         let first = self.stage.user_sgpr(crate::merged::RUNTIME_TABLE);
-        self.stage == HwStage::Gs
+        self.merged
+            && self.stage == HwStage::Gs
             && reg == Reg::S(first)
             && self.param_of(reg).is_none()
             && self.param_of(Reg::S(first + 1)).is_none()
@@ -2429,6 +2460,8 @@ pub(crate) mod tests {
     fn track_words(words: &[u32], layout: &[RootParam], stage: HwStage) -> Resources {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
+        // (a geometry program is the merged stage's, with the layout of both halves)
+        let track = if stage == HwStage::Gs { track_merged } else { track };
         track(&p, layout, stage, lanes(&p).as_ref()).unwrap()
     }
 
@@ -3898,6 +3931,7 @@ pub(crate) mod tests {
     fn track_error(words: &[u32], layout: &[RootParam], stage: HwStage) -> ShaderError {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
+        let track = if stage == HwStage::Gs { track_merged } else { track };
         track(&p, layout, stage, lanes(&p).as_ref()).unwrap_err()
     }
 
@@ -3913,6 +3947,17 @@ pub(crate) mod tests {
         // The root parameters of the title sit after it, in the same stage.
         let r = track_words(&load_b8(8), &[param(Table, 2, 1)], HwStage::Gs);
         assert_eq!(r.scalar, [((0, 0), at(RUNTIME_TABLE, 0xB8))]);
+    }
+
+    /// Only a layout that holds both halves' parameters can say the first two
+    /// user-data dwords are no one's: a geometry program tracked as it is, with
+    /// the ES half unknown, still fails on a load through them.
+    #[test]
+    fn the_runtime_table_needs_the_merged_layout() {
+        let code: Vec<u8> = load_b8(8).iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Gs, lanes(&p).as_ref()).unwrap_err();
+        assert!(matches!(err, ShaderError::Unsupported { what, .. } if what == NO_ROOT_WHAT), "{err:?}");
     }
 
     #[test]

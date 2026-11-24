@@ -426,7 +426,11 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let lanes = structured.as_ref().ok();
                 let geometry = p.stage == HwStage::Gs;
                 t.gs_programs += usize::from(geometry);
-                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+                // (the ES half each geometry program pairs with is not in
+                // its container: its user data 0 and 1 are taken as free, which
+                // the geometry line says)
+                let track = if geometry { resource::track_merged } else { resource::track };
+                let res = match track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {
                         t.gs_tracked += usize::from(geometry);
                         tally_resources(&p, &r, t);
