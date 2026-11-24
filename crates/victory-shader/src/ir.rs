@@ -166,11 +166,18 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             exit: Exit::End,
         })
         .collect();
-    let next_offsets: Vec<Option<usize>> = (0..list.len())
-        .map(|i| list.get(i + 1).map(|n| n.offset))
-        .collect();
-    for (n, ((machine, flow), next)) in list.into_iter().zip(flows).zip(next_offsets).enumerate() {
-        let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
+    let mut decoded = list.into_iter().zip(flows).enumerate().peekable();
+    let mut b = 0;
+    while let Some((n, (machine, flow))) = decoded.next() {
+        let next = decoded.peek().map(|(_, (inst, _))| inst.offset);
+        let leader = leaders.get(b + 1).copied();
+        if let Some(target) = leader
+            && next.is_none_or(|offset| target < offset)
+        {
+            return Err(isa(target, "jump target is not an instruction boundary"));
+        }
+        // Both the decoded instructions and block leaders are in address order.
+        let next_block = next.is_some() && next == leader;
         let name = machine.name().ok_or(ShaderError::Unsupported {
             offset: machine.offset,
             what: "unknown opcode",
@@ -184,8 +191,12 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         {
             (*to, *from) = (parked[k].1, parked[k].2);
         }
-        let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
-        let ends = flow != Flow::Next || next.is_none_or(|n| leaders.binary_search(&n).is_ok());
+        let fallthrough = || {
+            next_block
+                .then_some(b + 1)
+                .ok_or(isa(machine.offset, "falls off the code"))
+        };
+        let ends = flow != Flow::Next || next.is_none() || next_block;
         if ends {
             blocks[b].exit = match flow {
                 Flow::Next => Exit::Jump(fallthrough()?),
@@ -212,6 +223,9 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
                 reads: unset(reads),
                 writes: unset(writes),
             });
+        }
+        if next_block {
+            b += 1;
         }
     }
     link(&mut blocks);
@@ -1605,6 +1619,36 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+    }
+
+    #[test]
+    fn a_late_far_jump_must_target_a_decoded_instruction() {
+        // The decoder visits the setpc first. After sorting the instructions
+        // by address we can see its preceding getpc/add sequence, whose
+        // computed target at byte 24 is the add's literal.
+        let code = [
+            0xBF85_0003u32, // s_cbranch_scc1 -> 16
+            0xBF85_0006,    // s_cbranch_scc1 -> 32
+            S_ENDPGM,
+            0xBF80_0000,
+            0xBE88_1F00, // s_getpc_b64 s[8:9]
+            0x8008_FF08, // s_add_u32 s8, s8, 4
+            4,
+            0x8209_8009, // s_addc_u32 s9, s9, 0
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+        ];
+        let bytes: Vec<_> = code.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let result = build(&bytes, false, 256);
+        assert!(
+            matches!(
+                result,
+                Err(ShaderError::Isa {
+                    offset: 24,
+                    reason: "jump target is not an instruction boundary"
+                })
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]

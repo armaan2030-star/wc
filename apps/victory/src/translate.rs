@@ -2,11 +2,13 @@
 //! what it cannot handle yet is tallied (decision 0003).
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -69,6 +71,7 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    written: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -130,6 +133,7 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.written += other.written;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -144,12 +148,15 @@ impl Tally {
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
-struct Checks {
+struct Checks<'a> {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
     validator: Option<Validator>,
+    validation_requested: bool,
     host: Option<(Host, emit::HostShader)>,
+    output: Option<&'a Path>,
+    timings: bool,
 }
 
 pub fn run(
@@ -158,8 +165,11 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    output: Option<PathBuf>,
+    timings: bool,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    let output = output.as_deref().map(prepare_output_dir).transpose()?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
@@ -191,15 +201,55 @@ pub fn run(
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
-            .filter_map(Result::ok)
+            .filter_entry(|entry| {
+                output.as_ref().is_none_or(|output| {
+                    !entry.file_type().is_dir()
+                        || entry.path().canonicalize().ok().as_ref() != Some(output)
+                })
+            })
         {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if output.is_some() {
+                        lock(&total).fail(format!("input: {error}"), || {
+                            root.display().to_string()
+                        });
+                    }
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() {
                 continue;
             }
-            let Ok(data) = std::fs::read(entry.path()) else {
+            let shader_file = entry.path().extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("dxbc") || ext.eq_ignore_ascii_case("cdxil")
+            });
+            if entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                if output.is_some() && shader_file {
+                    lock(&total).fail("shader file exceeds the input limit".into(), || {
+                        entry.path().display().to_string()
+                    });
+                }
                 continue;
+            }
+            let data = match std::fs::read(entry.path()) {
+                Ok(data) => data,
+                Err(error) => {
+                    if output.is_some() {
+                        lock(&total).fail(format!("input: {error}"), || {
+                            entry.path().display().to_string()
+                        });
+                    }
+                    continue;
+                }
             };
             let jobs = sources(&data);
+            if jobs.is_empty() && output.is_some() && shader_file {
+                lock(&total).fail("no shader containers found".into(), || {
+                    entry.path().display().to_string()
+                });
+            }
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
@@ -213,9 +263,12 @@ pub fn run(
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
                                 .flatten(),
+                            validation_requested: validate,
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
+                            output: output.as_deref(),
+                            timings,
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -293,6 +346,10 @@ pub fn run(
             println!("pair {v} + {p}: {made}");
         }
     }
+    let incomplete = t.written == 0 || !t.failed.is_empty();
+    if output.is_some() {
+        println!("DXIL files   {} written", t.written);
+    }
     let mut lines = t.lines;
     lines.sort();
     for l in lines {
@@ -303,7 +360,16 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
+    ensure!(output.is_none() || !incomplete, "DXIL export incomplete");
     Ok(())
+}
+
+fn prepare_output_dir(path: &Path) -> Result<PathBuf> {
+    victory_core::ensure_outside_repo(path)?;
+    std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+    let path = path.canonicalize()?;
+    victory_core::ensure_outside_repo(&path)?;
+    Ok(path)
 }
 
 fn translate(
@@ -311,7 +377,7 @@ fn translate(
     path: &Path,
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -319,7 +385,9 @@ fn translate(
     };
     // The hash a run's log names the shader by (`hash=` in "first bind",
     // "shader does not translate", "host pipeline refused").
-    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    let container_hash = blake3::hash(&bytes);
+    let identity = container_hash.to_hex();
+    let hash = &identity[..16];
     // Diagnostics: `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates
     // those containers alone.
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -336,8 +404,9 @@ fn translate(
     }
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
-    let Ok(container) = Container::parse(&bytes) else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
+    let container = match Container::parse(&bytes) {
+        Ok(container) => container,
+        Err(error) => return t.fail(error.to_string(), example),
     };
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -365,7 +434,14 @@ fn translate(
             let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
         }
     }
-    if !lock(seen).insert(code) {
+    // Exported DXIL also depends on signatures and metadata outside the
+    // original DXIL part. Keep distinct input containers in export mode.
+    let dedup_key = if checks.output.is_some() {
+        container_hash
+    } else {
+        code
+    };
+    if !lock(seen).insert(dedup_key) {
         t.duplicates += 1;
         if t.list {
             t.lines.push(format!("{}  duplicate", example()));
@@ -376,11 +452,14 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    if checks.output.is_some() && programs.is_empty() {
+        return t.fail("no native programs in the DXIL part".into(), example);
+    }
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    translate_programs(&container, programs, &identity, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -393,9 +472,24 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
-    for p in programs {
+fn translate_programs(
+    container: &Container,
+    programs: Vec<NativeProgram>,
+    identity: &str,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks<'_>,
+) {
+    for (index, p) in programs.into_iter().enumerate() {
         t.programs += 1;
+        let label = || format!("{} {:?} program {}", example(), p.stage, index + 1);
+        if checks.output.is_some()
+            && !matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms)
+        {
+            t.fail("unsupported hardware shader stage".into(), label);
+            continue;
+        }
+        let started = checks.timings.then(Instant::now);
         match victory_shader::spill::build(&p) {
             Ok(program) => {
                 t.translated += 1;
@@ -455,13 +549,23 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     }
                 };
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
-                    let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
+                            if let Some(started) = started {
+                                t.lines.push(format!(
+                                    "{}  translation {:?}, {} DXIL bytes",
+                                    label(),
+                                    started.elapsed(),
+                                    shader.dxil.len()
+                                ));
+                            }
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
+                            let destination = checks.output.map(|dir| {
+                                dir.join(format!("{identity}.{}.{:?}.dxil", index + 1, p.stage))
+                            });
+                            check(shader, t, checks, label, destination.as_deref());
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
@@ -487,7 +591,6 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
 /// static count of the whole program, not of one thread's path), and the
 /// host module's instructions by kind (`emit::census::KINDS`).
 fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &emit::HostShader) {
-    use std::io::Write;
     use victory_shader::gfx10::Fields;
     static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let Some(out) = OUT.get_or_init(|| {
@@ -531,8 +634,9 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
     label: impl Fn() -> String,
+    destination: Option<&Path>,
 ) {
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
@@ -551,12 +655,20 @@ fn check(
         );
     }
     if let Some((h, stub_ps)) = &checks.host {
+        let started = checks.timings.then(Instant::now);
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
+        if let Some(started) = started {
+            t.lines.push(format!(
+                "{}  pipeline check {:?}",
+                label(),
+                started.elapsed()
+            ));
+        }
         match made {
             Ok(()) => {
                 *counter(t, shader.stage, 3) += 1;
@@ -568,6 +680,11 @@ fn check(
         }
     }
     let Some(v) = checks.validator.as_mut() else {
+        if checks.validation_requested {
+            t.fail("validator: unavailable in translation worker".into(), label);
+        } else if let Some(path) = destination {
+            record_output(t, path, &shader.dxil, label);
+        }
         return;
     };
     match v.validate(&mut shader.dxil) {
@@ -575,6 +692,9 @@ fn check(
             *counter(t, shader.stage, 2) += 1;
             if t.list {
                 t.lines.push(format!("{}  validated", label()));
+            }
+            if let Some(path) = destination {
+                record_output(t, path, &shader.dxil, label);
             }
         }
         Err(text) => {
@@ -604,6 +724,22 @@ fn check(
             t.fail(format!("validator: {first}"), label);
         }
     }
+}
+
+fn record_output(t: &mut Tally, path: &Path, dxil: &[u8], label: impl FnOnce() -> String) {
+    match write_output(path, dxil) {
+        Ok(()) => t.written += 1,
+        Err(error) => t.fail(format!("DXIL output: {error:#}"), label),
+    }
+}
+
+fn write_output(path: &Path, dxil: &[u8]) -> Result<()> {
+    let mut staged = tempfile::NamedTempFile::new_in(path.parent().expect("output directory"))?;
+    staged.write_all(dxil)?;
+    staged
+        .persist_noclobber(path)
+        .with_context(|| format!("publishing {} without overwriting", path.display()))?;
+    Ok(())
 }
 
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,

@@ -172,11 +172,18 @@ victory inspect <exe|dll> [--imports] [--exports]
 victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N] [--output DIR] [--timings]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
 ```
+
+Use `translate --output DIR` to export host DXIL outside the repository.
+Each filename contains the input container's hash, program ordinal and stage.
+The batch preserves existing outputs and reports validation and write failures
+after processing the remaining shaders. `--timings` prints per-program CPU
+translation times and DXIL sizes. With `--pipelines` it also prints the time
+spent checking the host pipeline.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).

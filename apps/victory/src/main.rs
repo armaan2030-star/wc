@@ -1,7 +1,7 @@
 //! `victory`: the command-line front end.
 //!
-//! Every command reads the user's own files and writes only to stdout or to
-//! the user's cache directory (outside the repository).
+//! Every command reads the user's own files and keeps generated data outside
+//! the repository.
 
 mod census;
 mod inspect;
@@ -84,6 +84,12 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Write translated DXIL to a directory outside the repository.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Print per-program translation and optional pipeline times.
+        #[arg(long)]
+        timings: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -152,6 +158,8 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
+            output,
+            timings,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -161,7 +169,7 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(paths, validate, pipelines, list, jobs, output, timings)
         }
         Command::Run {
             exe,

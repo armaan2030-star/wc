@@ -80,18 +80,24 @@ impl<'a> Container<'a> {
         if count > MAX_PARTS {
             return Err(ShaderError::Malformed("implausible part count"));
         }
+        let parts_start = HEADER_SIZE + 4 * count;
+        if parts_start > data.len() {
+            return Err(ShaderError::Malformed("part offset table is truncated"));
+        }
         let mut parts = Vec::with_capacity(count);
         for i in 0..count {
             let offset = u32_at(data, HEADER_SIZE + 4 * i)? as usize;
-            let fourcc = FourCC(
-                data.get(offset..offset + 4)
-                    .ok_or(ShaderError::Malformed("part header out of bounds"))?
-                    .try_into()
-                    .expect("4 bytes"),
-            );
-            let size = u32_at(data, offset + 4)? as usize;
-            let body = data
-                .get(offset + 8..offset + 8 + size)
+            if offset < parts_start {
+                return Err(ShaderError::Malformed("part overlaps container header"));
+            }
+            let part = data
+                .get(offset..)
+                .filter(|part| part.len() >= 8)
+                .ok_or(ShaderError::Malformed("part header out of bounds"))?;
+            let fourcc = FourCC(part[..4].try_into().expect("4 bytes"));
+            let size = u32_at(part, 4)? as usize;
+            let body = part[8..]
+                .get(..size)
                 .ok_or(ShaderError::Malformed("part data out of bounds"))?;
             parts.push(Part {
                 fourcc,
@@ -160,12 +166,25 @@ mod tests {
 
     #[test]
     fn round_trips_parts() {
-        let bytes = build(&[(FourCC::SFI0, &[1, 2, 3, 4]), (FourCC::HASH, &[9; 20])]);
+        let mut bytes = build(&[(FourCC::SFI0, &[1, 2, 3, 4]), (FourCC::HASH, &[9; 20])]);
+        bytes.extend_from_slice(b"trailing data");
         let c = Container::parse(&bytes).unwrap();
         assert_eq!(c.parts.len(), 2);
         assert_eq!(c.part(FourCC::SFI0).unwrap().data, &[1, 2, 3, 4]);
         assert_eq!(c.part(FourCC::HASH).unwrap().data.len(), 20);
         assert!(c.part(FourCC::DXIL).is_none());
+    }
+
+    #[test]
+    fn rejects_parts_in_container_metadata() {
+        for offset in [4u32, HEADER_SIZE as u32] {
+            let mut bytes = build(&[(FourCC([0; 4]), &[])]);
+            bytes[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&offset.to_le_bytes());
+            assert_eq!(
+                Container::parse(&bytes).unwrap_err(),
+                ShaderError::Malformed("part overlaps container header")
+            );
+        }
     }
 
     #[test]
