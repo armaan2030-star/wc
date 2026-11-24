@@ -1128,14 +1128,12 @@ fn ds_min_max_f32_order_floats_and_return_the_old_value() {
         returns_new.extend(ds(plain, 0, 5, 2));
         returns_new.extend(ds(DS_READ_B32, 0, 5, 0));
         for (body, old_result) in [(returns_old, true), (returns_new, false)] {
-            // One thread with LDS declares WaveSize(32), which WARP's
-            // pipeline creation refuses: hardware only (the 64-thread test
-            // below runs on WARP too).
+            // One thread with LDS has no peers and needs no WaveSize(32), so it
+            // runs on both hardware (including 64-only GCN GPUs) and WARP.
             let shader = build_cs(&body, 1, 512);
-            run_cases_on(
+            run_cases(
                 &shader,
                 &cases,
-                &[("hardware", false)],
                 |backend, _, inp, got| {
                     let (old, data) = (f32::from_bits(inp[0]), f32::from_bits(inp[1]));
                     let want = if old_result {
@@ -1263,4 +1261,105 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+#[test]
+fn scalar_sign_extension_preserves_scc() {
+    for (opcode, byte) in [(0x19, true), (0x1a, false)] {
+        let shader = build_valu_cs(&[
+            0xbf06_8001,               // s_cmp_eq_u32 s1, 0
+            0xbe86_0000 | opcode << 8, // sign-extend s0 into s6
+            sop2(0x0a, 7, 6, 2),       // s_cselect_b32 s7, s6, s2
+            vop1(0x001, 0, sgpr(7)),
+        ]);
+        let mut cases = Vec::new();
+        for input in [
+            0,
+            0xffff_007f,
+            0x1234_0080,
+            0xaaaa_7fff,
+            0x5555_8000,
+            u32::MAX,
+        ] {
+            for flag_input in [0, 1] {
+                cases.push([input, flag_input, 0x1234_5678, 0]);
+            }
+        }
+        run_cases(
+            &shader,
+            &cases,
+            |backend, _, [input, flag_input, fallback, _], got| {
+                let extended = if byte {
+                    i32::from(input as i8)
+                } else {
+                    i32::from(input as i16)
+                };
+                assert_eq!(
+                    got,
+                    if flag_input == 0 {
+                        extended as u32
+                    } else {
+                        fallback
+                    },
+                    "{backend}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn scalar_zero_counts_set_scc_for_nonzero_results() {
+    let cases = [
+        [0, 0, 0, 0],
+        [u32::MAX, u32::MAX, 0, 0],
+        [u32::MAX, 0, 0, 0],
+        [0, u32::MAX, 0, 0],
+        [0x8000_0001, 0xaaaa_5555, 0, 0],
+    ];
+    for (opcode, wide) in [(0x0d, false), (0x0e, true)] {
+        // Count zero bits in s0 or s[0:1] into s6. Complement the count on SCC=0.
+        let shader = build_valu_cs(&[
+            0xbe86_0000 | opcode << 8,
+            sop2(0x0a, 7, 128, 193),
+            sop2(0x12, 7, 6, 7),
+            vop1(0x001, 0, sgpr(7)),
+        ]);
+        run_cases(&shader, &cases, |backend, _, inputs, got| {
+            let count = inputs[0].count_zeros() + if wide { inputs[1].count_zeros() } else { 0 };
+            assert_eq!(got, if count == 0 { u32::MAX } else { count }, "{backend}");
+        });
+    }
+}
+
+/// Local terminal harness. With no inputs, exercise a byte sign extension.
+#[test]
+fn terminal_rdna_compute() {
+    let parse = |name, default: &str| {
+        std::env::var(name).unwrap_or_else(|_| default.to_owned())
+            .split_whitespace()
+            .map(|word| u32::from_str_radix(word.trim_start_matches("0x"), 16).expect("hex dword"))
+            .collect::<Vec<_>>()
+    };
+    let words = parse("RDNA_WORDS", "be861900 7e000206");
+    let inputs: [u32; 4] = parse("RDNA_INPUTS", "80 0 0 0").try_into().expect("four input dwords");
+    let shader = build_valu_cs(&words);
+    let host = Host::new(false).expect("requested D3D12 hardware adapter");
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+    let mut constants = vec![0; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        constants[u.index as usize] = match (u.root, u.slot) {
+            (RootType::Constants, 0) => inputs[u.dword as usize],
+            (RootType::Table, 1) => 0,
+            other => panic!("unexpected binding {other:?}"),
+        };
+    }
+    let output = host.dispatch(&root, &pso, &Dispatch {
+        roots: vec![(0, Root::Constants(constants))],
+        views: &[View::RawUav(1)], samplers: &[], groups: [1, 1, 1],
+    }).expect("dispatch and read back")[0][0];
+    println!("v0 = 0x{output:08x} ({output} unsigned, {} signed)", output as i32);
+    if std::env::var_os("RDNA_WORDS").is_none() && std::env::var_os("RDNA_INPUTS").is_none() {
+        assert_eq!(output, 0xffff_ff80);
+    }
 }
