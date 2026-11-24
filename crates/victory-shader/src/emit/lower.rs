@@ -24,6 +24,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+mod split_lds;
+
+use split_lds::{VISIBILITY_SNAPSHOT_SLOT, lds_snapshot_meetings, split_lds_on, visibility_initializer};
 
 type Why = &'static str;
 
@@ -59,6 +62,8 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// The shader may only run on a direct dispatch with one group in X.
+    pub dispatch_x_one: bool,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -88,16 +93,37 @@ enum Stop {
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut try_snapshot = split_lds_on()
+        && host_max_wave() == 32
+        && !LOCAL_WAVES.get()
+        && super::group_sync() != 0
+        && visibility_initializer(parts);
     loop {
-        match Lower::new(parts, &bad).run() {
+        let prior_needs = NEEDS.with_borrow(Vec::len);
+        let lower = Lower::new(parts, &bad, try_snapshot);
+        let snapshot = lower.lds_snapshot;
+        let result = lower.run();
+        if snapshot && result.is_err() {
+            NEEDS.with_borrow_mut(|n| n.truncate(prior_needs));
+        }
+        match result {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
+                    if snapshot {
+                        try_snapshot = false;
+                        bad.clear();
+                        continue;
+                    }
                     return Err(ShaderError::Unsupported {
                         offset: 0,
                         what: "a phi that does not settle",
                     });
                 }
+            }
+            Err(Stop::Fail(_)) if snapshot => {
+                try_snapshot = false;
+                bad.clear();
             }
             Err(Stop::Fail(e)) => return Err(e),
         }
@@ -239,6 +265,8 @@ struct Lower<'a> {
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+    /// A fixed LDS load used as a group-wide snapshot. The final DXIL must certify its meetings.
+    lds_snapshot: bool,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
@@ -1226,7 +1254,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, try_snapshot: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1248,6 +1276,7 @@ impl<'a> Lower<'a> {
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
+        let mut lds_snapshot = false;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
@@ -1314,6 +1343,15 @@ impl<'a> Lower<'a> {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
+                        if !lds_ok
+                            && try_snapshot
+                            && !console_lanes
+                            && let Some(meet) = lds_snapshot_meetings(p, x.st, &all, cs.lds_bytes())
+                        {
+                            lds_meet = Some(meet);
+                            lds_snapshot = true;
+                            lds_ok = true;
+                        }
                         if !lds_ok {
                             // (the blocks whose LDS accesses not every lane runs: with the
                             // branches around them taken wave-wide they get their barriers)
@@ -1374,8 +1412,9 @@ impl<'a> Lower<'a> {
                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
                 }
             }
-            if wave == 32 && x.native.wave64 {
-                // console threads go to host waves in the order the waves take them (`wave_base`)
+            if wave == 32 && x.native.wave64 && !lds_snapshot {
+                // Console threads go to host waves in the order the waves take them (`wave_base`).
+                // The verified snapshot has no console-lane dependencies and uses native thread IDs.
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
@@ -1503,6 +1542,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             split_lds,
             lds_meet,
+            lds_snapshot,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
@@ -2116,6 +2156,7 @@ impl<'a> Lower<'a> {
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
+            dispatch_x_one: self.lds_snapshot,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -2124,7 +2165,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            dxil: self
+                .s
+                .finish_checked(self.lds_snapshot.then_some(VISIBILITY_SNAPSHOT_SLOT))
+                .ok_or_else(|| unsupported(0, "an LDS snapshot without a convergence proof"))?,
             user_data,
             samplers: self.samplers,
         })
@@ -4411,8 +4455,17 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
+                    // Keep the address of a masked-out lane from issuing a
+                    // speculative load. The meeting stands outside this guard.
+                    let at = self.begin_guarded(if self.lds_snapshot { guard } else { None });
                     let p = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
+                    let x = if at.is_some() {
+                        let zero = self.s.m.i32(0);
+                        self.end_guarded(at, &[(x, zero)])[0]
+                    } else {
+                        x
+                    };
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }

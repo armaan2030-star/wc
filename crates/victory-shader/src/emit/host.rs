@@ -587,6 +587,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         .collect();
     s.m.terminate(b, Term::Ret);
     HostShader {
+        dispatch_x_one: false,
         stage: if pixel {
             crate::native::HwStage::Ps
         } else {

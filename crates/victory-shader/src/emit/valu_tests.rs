@@ -172,6 +172,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     .expect("lower");
 
     let shader = HostShader {
+        dispatch_x_one: false,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

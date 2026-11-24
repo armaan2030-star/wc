@@ -310,6 +310,12 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
+impl HostPipeline {
+    pub(crate) fn dispatch_x_one(&self) -> bool {
+        self.compute && self.stages.iter().any(|s| s.translated().host.dispatch_x_one)
+    }
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());

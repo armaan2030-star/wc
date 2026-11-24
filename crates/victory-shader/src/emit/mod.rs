@@ -219,6 +219,8 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
     pub stage: HwStage,
+    /// A nonempty compute dispatch must have exactly one X group.
+    pub dispatch_x_one: bool,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
@@ -639,6 +641,7 @@ fn emit_program(
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
+        dispatch_x_one: l.dispatch_x_one,
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l
@@ -1024,6 +1027,7 @@ mod tests {
             return;
         };
         let ps = super::HostShader {
+            dispatch_x_one: false,
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
             user_data: Vec::new(),
@@ -1036,6 +1040,7 @@ mod tests {
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
+                dispatch_x_one: false,
                 stage,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
@@ -1325,6 +1330,7 @@ mod tests {
         #[cfg(windows)]
         if let Ok(host) = super::host::Host::new(false) {
             let cs = super::HostShader {
+                dispatch_x_one: false,
                 stage: super::HwStage::Cs,
                 dxil,
                 user_data: l.user_data,

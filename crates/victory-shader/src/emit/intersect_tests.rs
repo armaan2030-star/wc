@@ -179,6 +179,7 @@ fn build(
         mesh_stride: 0,
     })?;
     let shader = HostShader {
+        dispatch_x_one: false,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
