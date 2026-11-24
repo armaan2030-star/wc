@@ -113,8 +113,8 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_FAULTS, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit,
 };
 
@@ -475,6 +475,29 @@ pub fn emit(
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
+            }
+        }
+        // A lane write or read where the lane it names may not be ([`lower::LANE_ELSEWHERE`]):
+        // right once the wave takes the branches around it together, so that every lane is
+        // there. Where the host's waves are the console's that costs no barrier; a console
+        // wave run as two host waves has had its other forms tried above. Failing that, the
+        // whole of this once more as before: among the lanes that are there.
+        Err(ShaderError::Unsupported { what, .. })
+            if native.stage == HwStage::Cs && what == lower::LANE_ELSEWHERE =>
+        {
+            let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+            let halves = native.wave64 && lower::host_max_wave() == 32;
+            let again = if halves { None } else { Some(widen(c, native, p, why)) };
+            if why {
+                match &again {
+                    Some(Ok(_)) => eprintln!("LANE-ELSEWHERE branches taken wave-wide"),
+                    Some(Err(e)) => eprintln!("LANE-ELSEWHERE lanes as they stand: wave-wide, {e}"),
+                    None => eprintln!("LANE-ELSEWHERE lanes as they stand: two host waves"),
+                }
+            }
+            match again {
+                Some(Ok(r)) => Ok(r),
+                _ => return lower::with_lanes_as_they_stand(|| emit(c, native, p, st, io, res)),
             }
         }
         other => other,
