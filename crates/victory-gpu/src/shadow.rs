@@ -66,6 +66,10 @@ pub(crate) struct Shadow {
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
+    #[cfg(feature = "diagnostics")]
+    admission: CardDecision,
+    #[cfg(feature = "diagnostics")]
+    ranked: RankCounter,
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
@@ -143,15 +147,27 @@ pub(crate) fn cards() -> bool {
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// `VICTORY_CARD_BUFFERS_MIN_KB` overrides the minimum in KiB, with a
+/// 64 KiB floor; invalid or overflowing values use the MB setting instead.
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
+fn card_minimum(kib: Option<&str>, mib: Option<&str>) -> u64 {
+    let legacy = || (mib.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(16) << 20).max(1 << 20);
+    kib.and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(|v| v.checked_mul(1 << 10))
+        .map(|v| v.max(64 << 10))
+        .unwrap_or_else(legacy)
+}
+
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        let kib = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok();
+        let mib = std::env::var("VICTORY_CARD_BUFFERS_MIN_MB").ok();
+        (card_minimum(kib.as_deref(), mib.as_deref()), mb("VICTORY_CARD_BUFFERS_MB", 512))
     })
 }
 
@@ -190,17 +206,34 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
-    if !cards() {
-        return None;
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardDecision {
+    Disabled, BelowMinimum, TooLarge, NoHost, CompareUnavailable,
+    MemoryBudget, ConfiguredBudget, AllocationFailed, Admitted,
+    #[cfg(feature = "diagnostics")]
+    NotAttempted,
+}
+
+fn card_size_decision(enabled: bool, size: u64, least: u64) -> Option<CardDecision> {
+    if !enabled { Some(CardDecision::Disabled) }
+    else if size < least { Some(CardDecision::BelowMinimum) }
+    else if size >= 1 << 30 { Some(CardDecision::TooLarge) }
+    else { None }
+}
+
+fn card_budget_decision(total: u64, limit: u64, reason: CardDecision) -> Option<CardDecision> {
+    (total > limit).then_some(reason)
+}
+
+fn card_for(size: u64) -> (Option<ID3D12Resource>, CardDecision) {
+    if !cards() { return (None, CardDecision::Disabled); }
     let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
-        return None;
+    if let Some(reason) = card_size_decision(true, size, least) {
+        return (None, reason);
     }
-    let host = host()?;
+    let Some(host) = host() else { return (None, CardDecision::NoHost) };
     if !host.card_ready() {
-        return None;
+        return (None, CardDecision::CompareUnavailable);
     }
     // Only while the card has room: with this copy on it, a fifth of the
     // budget the system gives us must still be free. Copies are made when
@@ -209,19 +242,20 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // them, so the card's use stays where it was and the textures' share
     // shrinks by the copies' bytes, at most `card_limits`' second number.
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && card_budget_decision(used + size, budget / 10 * 8, CardDecision::MemoryBudget).is_some()
     {
-        return None;
+        return (None, CardDecision::MemoryBudget);
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+    if card_budget_decision(CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size, most, CardDecision::ConfiguredBudget).is_some() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
+        return (None, CardDecision::ConfiguredBudget);
     }
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
-    buffer
+    let reason = if buffer.is_some() { CardDecision::Admitted } else { CardDecision::AllocationFailed };
+    (buffer, reason)
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
@@ -1208,11 +1242,71 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
 /// ranges compared in windows and in buffers' copies.
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct RankCounter(Mutex<(u64, u64)>);
+
+#[cfg(feature = "diagnostics")]
+impl RankCounter {
+    fn add(&self, bytes: u64) {
+        let mut interval = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        interval.0 = interval.0.saturating_add(bytes);
+        interval.1 = interval.1.saturating_add(1);
+    }
+    fn take(&self) -> (u64, u64) {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn snapshot_rank_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SNAPSHOT_RANK").is_some_and(|v| v == "1"))
+}
+
+/// Aggregate only live title-buffer shadows, once per five seconds. Bytes
+/// are the same newly declared ranges counted in BACK_CLASS, not a measure
+/// of physical traffic when kept snapshots are enabled.
+#[cfg(feature = "diagnostics")]
+fn snapshot_rank_line() {
+    if !snapshot_rank_enabled() { return; }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last.saturating_add(5000)
+        || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() { return; }
+    let mut reasons = std::collections::BTreeMap::<String, (u64, u64)>::new();
+    let mut ranks = Vec::new();
+    {
+        let entries = buffers();
+        for entry in entries.values() {
+            let Some(s) = &entry.shadow else { continue };
+            let reason = format!("{:?}", s.admission);
+            let aggregate = reasons.entry(reason).or_default();
+            aggregate.0 += 1;
+            aggregate.1 = aggregate.1.saturating_add(s.len);
+            // The writer never takes the buffer registry while holding this
+            // counter lock; registry -> counter therefore cannot cycle.
+            let (bytes, ranges) = s.ranked.take();
+            if bytes > 0 { ranks.push((bytes, ranges, s.id, s.start, s.len, s.admission)); }
+        }
+    }
+    ranks.sort_unstable_by_key(|row| std::cmp::Reverse(row.0));
+    tracing::info!(interval_ms = now.saturating_sub(last), kept_snapshots = keeps(),
+        "snapshot ranking: surviving live title-buffer admissions (count, total bytes): {reasons:?}; {} active buffers, top 10 follow", ranks.len());
+    for (bytes, ranges, id, start, len, admission) in ranks.into_iter().take(10) {
+        tracing::info!(id, start = format_args!("{start:#x}"), len, ?admission, bytes, ranges,
+            "snapshot ranking: newly declared CPU snapshot bytes and contributing ranges since last report");
+    }
+}
+
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    #[cfg(feature = "diagnostics")]
+    snapshot_rank_line();
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -1237,6 +1331,59 @@ mod wide_tests {
     use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn card_minimum_kib_overrides_legacy_and_rejects_bad_values() {
+        use super::{CardDecision, card_minimum, card_size_decision};
+        let min = card_minimum(Some("640"), Some("16"));
+        assert_eq!(min, 640 * 1024);
+        for size in [655360u64, 793264, 793296, 921600] {
+            let rounded = size.next_multiple_of(64 * 1024);
+            assert_eq!(card_size_decision(true, rounded, min), None);
+        }
+        assert_eq!(card_size_decision(true, 9 * 64 * 1024, min), Some(CardDecision::BelowMinimum));
+        assert_eq!(card_minimum(Some("1"), None), 64 * 1024);
+        assert_eq!(card_minimum(None, None), 16 * 1024 * 1024);
+        assert_eq!(card_minimum(None, Some("0")), 1024 * 1024);
+        assert_eq!(card_minimum(Some("invalid"), Some("3")), 3 * 1024 * 1024);
+        assert_eq!(card_minimum(Some("18446744073709551615"), Some("3")), 3 * 1024 * 1024);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn snapshot_rank_reports_coherent_intervals() {
+        let counter = std::sync::Arc::new(super::RankCounter::default());
+        let writer = {
+            let counter = counter.clone();
+            std::thread::spawn(move || for _ in 0..10_000 { counter.add(17); })
+        };
+        let mut totals = (0u64, 0u64);
+        for _ in 0..100 {
+            let (bytes, ranges) = counter.take();
+            assert_eq!(bytes, ranges * 17);
+            totals.0 += bytes;
+            totals.1 += ranges;
+            std::thread::yield_now();
+        }
+        writer.join().unwrap();
+        let (bytes, ranges) = counter.take();
+        assert_eq!(bytes, ranges * 17);
+        totals.0 += bytes;
+        totals.1 += ranges;
+        assert_eq!(totals, (170_000, 10_000));
+    }
+
+    #[test]
+    fn card_admission_classifies_threshold_and_budget() {
+        use super::{CardDecision, card_budget_decision, card_size_decision};
+        assert_eq!(card_size_decision(false, 32, 16), Some(CardDecision::Disabled));
+        assert_eq!(card_size_decision(true, 8, 16), Some(CardDecision::BelowMinimum));
+        assert_eq!(card_size_decision(true, 1 << 30, 16), Some(CardDecision::TooLarge));
+        assert_eq!(card_size_decision(true, 32, 16), None);
+        assert_eq!(card_budget_decision(100, 100, CardDecision::MemoryBudget), None);
+        assert_eq!(card_budget_decision(101, 100, CardDecision::MemoryBudget), Some(CardDecision::MemoryBudget));
+        assert_eq!(card_budget_decision(101, 100, CardDecision::ConfiguredBudget), Some(CardDecision::ConfiguredBudget));
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.
@@ -1717,6 +1864,10 @@ impl Shadow {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
             },
+            #[cfg(feature = "diagnostics")]
+            admission: CardDecision::NotAttempted,
+            #[cfg(feature = "diagnostics")]
+            ranked: RankCounter::default(),
             card: None,
             window: false,
             place: None,
@@ -1806,6 +1957,10 @@ impl Shadow {
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if !self.window && taken > 0 && snapshot_rank_enabled() {
+            self.ranked.add(taken as u64);
+        }
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
@@ -2793,7 +2948,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let (on_card, admission) = card_for(size);
+        let (buffer, card) = match on_card {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
@@ -2828,6 +2984,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             );
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+        #[cfg(feature = "diagnostics")]
+        { shadow.admission = admission; }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = admission;
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
