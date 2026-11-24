@@ -26,6 +26,8 @@ pub mod device;
 mod draw;
 pub mod dxgi;
 pub mod fence;
+#[cfg(windows)]
+mod flip;
 pub mod frame;
 #[cfg(windows)]
 mod host;
