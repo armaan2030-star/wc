@@ -1017,33 +1017,32 @@ fn into_destination(
     let retries = *RETRIES.get_or_init(|| {
         std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
     });
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+    let mut result = super::xmem::write_physical(pages, offset, &data[..n]);
     let mut tries = 0;
-    while !written && tries < retries {
+    while result.is_err() && tries < retries {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
+        result = super::xmem::write_physical(pages, offset, &data[..n]);
     }
-    if written {
+    let Err(error) = result else {
         if tries > 0 {
             tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
         }
-        Ok(())
-    } else {
-        let known = super::xmem::pages_known(pages, offset, len);
-        tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
-    }
+        return Ok(());
+    };
+    // Said aloud: the title never reads a request's result
+    // (it only polls for completion), so a destination left unwritten
+    // is a model or texture that silently holds whatever its pages
+    // held before.
+    tracing::warn!(
+        offset,
+        len,
+        pages = pages.len(),
+        retries = tries,
+        %error,
+        "dstorage: a destination's physical pages could not be written; its request fails"
+    );
+    Err(E_INVALIDARG)
 }
 
 /// Slots by the 2020 order, which the argument shapes at
