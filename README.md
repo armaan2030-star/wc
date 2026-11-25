@@ -73,6 +73,103 @@ Each is described in a comment where it is read.
 - A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
 - Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
 
+### justlovett0 fork — Windows 10 / RTX 3080 verification (2026-11-25)
+
+Verified on a second machine: **Windows 10 22H2 (19044), Ryzen 9 7900X,
+NVIDIA RTX 3080 10 GB, driver 621.24 (32.0.16.2124)**, Series X profile.
+
+**Windows 10 launch.** The inbox D3D12 runtime reports SM 6.5, so the fork's
+SM 6.6 shaders need the **Agility SDK 1.620.2** (upstream PR #175) beside the
+executable (`cargo xtask agility`; the exe exports `D3D12SDKVersion` /
+`D3D12SDKPath`). With it the title boots, plays the intro and enters the world
+without the init crash the SM 6.5 runtime causes.
+
+**Best verified configuration** — textures, world geometry and mostly-correct
+static lighting, ~4 fps (230-250 ms per frame):
+
+```bash
+VICTORY_BVH_BUILDER=1 VICTORY_BVH_QUARANTINE=1 \
+VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 \
+VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024 \
+VICTORY_TEXTURE_MIP_DROP=1 VICTORY_RELAY=1 \
+  victory.exe run "<game>\game_scarlett_master.exe" --execute
+```
+
+Findings on this machine:
+
+- **Static ray-traced lighting works** with `BVH_BUILDER=1 QUARANTINE=1`: the
+  trace/shading programs read the title's pre-built static acceleration
+  structures. The dynamic builder stays off (3 of its 53 programs fail a
+  divergent cross-half first-lane read), so shadowed areas are still darker than
+  sunlit ones.
+- **Texture mip-drop** — a port of upstream VIctory #1272, adapted to this fork's
+  lazy host-copy path (`Hosted`/`Made`/`Twin`, idle eviction).
+  `VICTORY_TEXTURE_MIP_DROP=1` drops the top mip of pure sampled textures. It
+  barely moves the frame rate (the world is not texture-bandwidth bound) but
+  **vastly improves lighting**, apparently by keeping irradiance/lighting textures
+  resident under lower VRAM pressure. Unset (default) is bit-identical to before;
+  render targets, depth and MSAA are exempt; allocation retries on
+  `E_OUTOFMEMORY`. Adds SRV mip-window re-basing, subresource remapping for
+  copies/resolves, and per-subresource host-written tracking.
+- **`VICTORY_RELAY=1`** (ordered relay worker) gives ~230-250 ms vs ~260-270 ms
+  without it, overlapping copy-back/merge with the next frame's preparation.
+  **`VICTORY_RELAY=2`** (precise per-memory waits) is *slower* here (250-270 ms).
+- **The frame rate is latency/synchronisation bound, not throughput bound**: CPU
+  and GPU usage are low during play. With minimal rendering (looking straight up)
+  the frame is ~150 ms; a full scene adds ~80-100 ms. The ~150 ms floor is GPU
+  read-back fetch latency plus the title's own frame pacing, not compute — so more
+  GPU/CPU horsepower does not help; overlap does.
+
+Negative results on this machine (do not use):
+
+- `VICTORY_INPLACE=1` and `VICTORY_TEXTURE_NO_WAIT=1` both **break the RT
+  lighting**: the flight tracking knows shader writes only through declared copy
+  ranges, so bypassing copies leaves stale/empty lighting reads.
+- `VICTORY_WIDE_REFRESH=1`, `VICTORY_CARD_REHASH_RUNS=1`,
+  `VICTORY_UNWATCHED_FRAMES=2`: no frame-rate gain (the refresh copies are kernel
+  page-fault bound, not thread bound).
+- The newer `fxceless/victory-fork` **shader clean-up optimizer renders the scene
+  black** here, and its **#11 lane-mask pair-restore removes world geometry**
+  (floor/walls) on this base — those shader-side changes do not transfer to this
+  fork's wave64 emitter unchanged. **Even a "safe" optimizer subset** (dead code,
+  folding, reuse, load-CSE = `VICTORY_SHADER_OPT=23`, excluding branch facts and
+  the wave64 first-lane exchange) renders black with missing geometry at
+  500-700 ms/frame: the optimizer is written for victory-fork's different emitter
+  and is unusable on this base in any combination.
+
+### A four-idea latency plan, tried and measured (2026-11-25)
+
+The frame is **latency-bound, not throughput-bound** (CPU/GPU usage low): a full
+scene is ~172 ms GPU rendering + ~64 ms CPU prep on the critical path, with the
+~86 ms GPU→CPU read-back fetch overlapped by `RELAY=1`. Four ideas from a faster
+reference were implemented behind switches and A/B tested in the same scene:
+
+- **VRAM residency** (`VICTORY_SCRATCH_VRAM=1`, kept, default off): CPU-written
+  scratch in CPU-visible VRAM via Resizable BAR (`Host::gpu_upload_buffer`,
+  CUSTOM + WRITE_COMBINE + L1, probed by `Host::rebar`, budget-guarded).
+  **Inactive on this box — the ReBAR probe is false** (Win10/RTX 3080); needs
+  Resizable BAR enabled. Falls back to system-RAM scratch cleanly.
+- **Batched indirect barriers** (`VICTORY_INDIRECT_BATCH`): the existing
+  `VICTORY_INDIRECT_WINDOW` alone gives no gain (260 ms), and deferring the
+  per-command return-to-COMMON barrier across window hits dropped world
+  geometry. The per-command barriers are not on this title's critical path;
+  abandoned.
+- **Parallel CPU prep** (`VICTORY_WIDE_PREP`): parallel `GetWriteWatch` over
+  disjoint runs (local journals, single asking-number merge under the held
+  lock) dropped world geometry — concurrent kernel write-watch RESET calls race
+  and miss writes. Reverted.
+- **CPU/GPU pipelining** (serve the title's GPU-memory reads card-side so frame
+  N+1 overlaps N): the safe forms already exist (`late_met`, `relay_exact`);
+  the full form is the `VICTORY_INPLACE` class that breaks RT lighting, so not
+  attempted enabled.
+
+Net: the safe ceiling on this machine is ~230 ms (`RELAY=1` + mip-drop=1). The
+reference's 45-90 ms relies on the pipelining bypass and a ReBAR-enabled host.
+
+The intro pre-rendered video logo jitters in every mode (a frame-token pacing
+issue in `frame.rs`, not the relay or the shaders); the world itself presents in
+order with `RELAY=1`.
+
 Everything below this line is upstream VIctory's own README, unchanged; its
 status section describes upstream, not this fork.
 
@@ -130,6 +227,12 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+On Windows 10 the in-box D3D12 runtime stops at shader model 6.5, so the host
+refuses every translated pipeline. `cargo xtask agility` fetches Microsoft's
+D3D12 Agility SDK runtime (a pinned, hash-checked NuGet package) into
+`target\<profile>\D3D12\`, where `victory.exe` makes D3D12 load it. Windows 11
+needs nothing.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
@@ -138,6 +241,7 @@ the Windows paging file size, then retry.
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
+cargo xtask agility                      # Windows 10 only: newer D3D12 runtime
 cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```

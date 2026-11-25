@@ -1125,6 +1125,61 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// The console texture's full mip count (before any top-mip drop).
+    title_mips: u32,
+    /// Top console mip levels omitted from the host copy (0 = full chain).
+    mip_drop: u32,
+    /// Whether the console texture is 3D (subresources index mips directly).
+    is_3d: bool,
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    pub(crate) fn mip_drop(&self) -> u32 {
+        self.mip_drop
+    }
+
+    pub(crate) fn title_mips(&self) -> u32 {
+        self.title_mips
+    }
+
+    pub(crate) fn host_mips(&self) -> u32 {
+        self.title_mips.saturating_sub(self.mip_drop).max(1)
+    }
+
+    /// Maps a console subresource index onto the host texture's subresource
+    /// index, returning `None` when the addressed mip was dropped.
+    pub(crate) fn host_subresource(&self, console_sub: u32) -> Option<u32> {
+        remap_subresource(console_sub, self.title_mips, self.mip_drop, self.is_3d)
+    }
+}
+
+/// Maps a console subresource index onto a mip-dropped host texture's
+/// subresource index, returning `None` when the addressed mip was dropped.
+#[cfg(windows)]
+pub(crate) fn remap_subresource(
+    console_sub: u32,
+    title_mips: u32,
+    mip_drop: u32,
+    is_3d: bool,
+) -> Option<u32> {
+    if mip_drop == 0 {
+        return Some(console_sub);
+    }
+    let title_mips = title_mips.max(1);
+    let host_mips = title_mips.saturating_sub(mip_drop).max(1);
+    if is_3d {
+        if console_sub < mip_drop || console_sub >= title_mips {
+            return None;
+        }
+        return Some(console_sub - mip_drop);
+    }
+    let console_mip = console_sub % title_mips;
+    let slice = console_sub / title_mips;
+    if console_mip < mip_drop {
+        return None;
+    }
+    Some(slice * host_mips + (console_mip - mip_drop))
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1303,7 +1358,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        let Some((texture, mip_drop)) = host_texture(&r.desc, r.host.state, clear) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1322,6 +1377,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = HostTexture::new(texture, state);
         host.filled = fills(&r.desc);
+        host.title_mips = mip_count(&r.desc);
+        host.mip_drop = mip_drop;
+        host.is_3d = r.desc.dimension == TEXTURE_3D;
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);
@@ -1545,11 +1603,22 @@ impl HostTexture {
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        let is_3d = d.Dimension == windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        let mips = if is_3d {
+            u32::from(d.MipLevels)
+        } else {
+            u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
+        };
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            title_mips: mips.max(1),
+            mip_drop: 0,
+            is_3d,
         }
     }
 }
@@ -1614,14 +1683,172 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Number of dropped top mip levels for a resource's host texture (0 if none).
+#[cfg(windows)]
+pub(crate) fn host_mip_drop(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    hosted(this, false).map_or(0, |made| made.0.mip_drop())
+}
+
+/// `(mip_drop, host_mips)` for a resource's host texture, if it has one.
+#[cfg(windows)]
+pub(crate) fn host_mip_info(this: This) -> (u32, u32) {
+    if this.is_null() {
+        return (0, 1);
+    }
+    hosted(this, false).map_or((0, 1), |made| (made.0.mip_drop(), made.0.host_mips()))
+}
+
+/// Maximum number of top mip levels that may be dropped on sampled textures.
+#[cfg(windows)]
+const MAX_MIP_DROP: u32 = 3;
+
+/// Never shrink a texture below this largest-dimension floor (in texels), so
+/// tiny LUTs, icons, and 1x1 stand-in textures stay untouched.
+#[cfg(windows)]
+const MIN_DROPPED_EXTENT: u64 = 64;
+
+/// Process-wide automatic mip-drop pressure, raised monotonically when host
+/// texture allocation hits `E_OUTOFMEMORY`.
+#[cfg(windows)]
+static OOM_MIP_PRESSURE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// User-configured baseline mip drop from `VICTORY_TEXTURE_MIP_DROP` (0..=3),
+/// or `None` when unset (full quality, unless OOM pressure raises it).
+#[cfg(windows)]
+fn configured_mip_drop() -> Option<u32> {
+    static CONFIGURED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|n| n.min(MAX_MIP_DROP))
+    })
+}
+
+#[cfg(windows)]
+fn requested_mip_drop() -> u32 {
+    let base = configured_mip_drop().unwrap_or(0);
+    base.max(OOM_MIP_PRESSURE.load(std::sync::atomic::Ordering::Relaxed))
+        .min(MAX_MIP_DROP)
+}
+
+/// How many top mip levels can legally be dropped from `desc` for a target
+/// drop count `requested`. Only non-MSAA, non-RT/DS/UAV textures with enough
+/// mips and a block-aligned post-drop mip 0 are eligible.
+#[cfg(windows)]
+pub(crate) fn compute_mip_drop(desc: &ResourceDesc, requested: u32) -> u32 {
+    const TEXTURE_1D: u32 = 2;
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    if requested == 0
+        || desc.dimension == BUFFER
+        || desc.flags & TARGET_DEPTH_UNORDERED != 0
+        || desc.sample_count > 1
+    {
+        return 0;
+    }
+    let total_mips = mip_count(desc);
+    if total_mips <= 1 {
+        return 0;
+    }
+    let block = element(pc_format(desc.format)).map_or(1, |(_, b)| b);
+    let cap = requested.min(MAX_MIP_DROP).min(total_mips - 1);
+    let mut best = 0;
+    for d in 1..=cap {
+        let w = (desc.width >> d).max(1);
+        let h = if desc.dimension == TEXTURE_1D {
+            1
+        } else {
+            (u64::from(desc.height) >> d).max(1)
+        };
+        let depth = if desc.dimension == TEXTURE_3D {
+            (u64::from(desc.depth_or_array_size) >> d).max(1)
+        } else {
+            1
+        };
+        if w.max(h).max(depth) < MIN_DROPPED_EXTENT {
+            break;
+        }
+        if block > 1
+            && (w < block
+                || !w.is_multiple_of(block)
+                || (desc.dimension != TEXTURE_1D && (h < block || !h.is_multiple_of(block))))
+        {
+            break;
+        }
+        best = d;
+    }
+    best
+}
+
+/// Applies `drop` top-mip removals to a host `ResourceDesc` in place.
+#[cfg(windows)]
+fn apply_mip_drop(d: &mut ResourceDesc, title_mips: u32, drop: u32) {
+    const TEXTURE_1D: u32 = 2;
+    if drop == 0 {
+        return;
+    }
+    d.width = (d.width >> drop).max(1);
+    if d.dimension != TEXTURE_1D {
+        d.height = (d.height >> drop).max(1);
+    }
+    if d.dimension == TEXTURE_3D {
+        d.depth_or_array_size = ((u64::from(d.depth_or_array_size) >> drop).max(1)) as u16;
+    }
+    d.mip_levels = title_mips.saturating_sub(drop).max(1) as u16;
+}
+
+/// Runs a host texture allocator with automatic mip-drop retry on
+/// `E_OUTOFMEMORY`, escalating `pressure` monotonically so later allocations
+/// avoid repeated OOM failures.
+#[cfg(windows)]
+fn allocate_with_oom_retry<T, E, F>(
+    desc: &ResourceDesc,
+    initial_requested: u32,
+    pressure: &std::sync::atomic::AtomicU32,
+    is_oom: impl Fn(&E) -> bool,
+    mut make: F,
+) -> Result<(T, u32), (E, u32)>
+where
+    F: FnMut(u32) -> Result<T, E>,
+{
+    let mut drop = compute_mip_drop(desc, initial_requested);
+    loop {
+        match make(drop) {
+            Ok(value) => return Ok((value, drop)),
+            Err(err) if is_oom(&err) && drop < MAX_MIP_DROP => {
+                let next = compute_mip_drop(desc, drop + 1);
+                if next > drop {
+                    pressure.fetch_max(next, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        from = drop,
+                        to = next,
+                        width = desc.width,
+                        height = desc.height,
+                        format = desc.format,
+                        "host memory pressure: dropping texture mips automatically and retrying"
+                    );
+                    drop = next;
+                    continue;
+                }
+                return Err((err, drop));
+            }
+            Err(err) => return Err((err, drop)),
+        }
+    }
+}
+
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags. Returns the host resource and the
+/// number of top mips dropped.
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -1675,31 +1902,56 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout (checked size, same
-    // fields); the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
-            // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-            &mut texture,
-        )
-    };
-    if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no host texture");
+    let title_mips = mip_count(desc);
+    let initial_state = D3D12_RESOURCE_STATES(crate::host::legal_for(
+        d.flags,
+        crate::host::texture_state(state),
+    ) as i32);
+    let result = allocate_with_oom_retry(
+        desc,
+        requested_mip_drop(),
+        &OOM_MIP_PRESSURE,
+        |e: &windows::core::Error| e.code().0 == E_OUTOFMEMORY,
+        |drop| {
+            let mut dd = d;
+            apply_mip_drop(&mut dd, title_mips, drop);
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: the description has the host layout (checked size, same
+            // fields); the out pointer is ours.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    (&raw const dd).cast(),
+                    initial_state,
+                    // The same layout: format, then color or depth and stencil.
+                    clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                    &mut texture,
+                )
+            }?;
+            Ok(texture)
+        },
+    );
+    match result {
+        Ok((Some(t), drop)) => {
+            let mut dd = d;
+            apply_mip_drop(&mut dd, title_mips, drop);
+            crate::host::name(&t, || {
+                format!(
+                    "texture {}x{} f{} flags {:#x} drop {drop}",
+                    dd.width, dd.height, dd.format, dd.flags
+                )
+            });
+            Some((t, drop))
+        }
+        Ok((None, _)) => None,
+        Err((e, drop)) => {
+            let mut dd = d;
+            apply_mip_drop(&mut dd, title_mips, drop);
+            tracing::warn!(error = %e, desc = ?dd, drop, "no host texture");
+            None
+        }
     }
-    if let Some(t) = &texture {
-        crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
-        });
-    }
-    texture
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -3406,5 +3658,129 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    fn tex2d(width: u64, height: u32, mips: u16, format: u32, flags: u32) -> ResourceDesc {
+        ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width,
+            height,
+            depth_or_array_size: 1,
+            mip_levels: mips,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mip_drop_respects_constraints_and_bc_alignment() {
+        // Ordinary 2048x2048 BC1 world texture (format 71): drops 1..=3.
+        let world_bc1 = tex2d(2048, 2048, 10, 71, 0);
+        assert_eq!(compute_mip_drop(&world_bc1, 0), 0);
+        assert_eq!(compute_mip_drop(&world_bc1, 1), 1);
+        assert_eq!(compute_mip_drop(&world_bc1, 2), 2);
+        assert_eq!(compute_mip_drop(&world_bc1, 5), MAX_MIP_DROP);
+
+        // 256x256 full chain (mip_levels = 0 => 9 mips): stops at the 64 px floor (drop 2).
+        let medium = tex2d(256, 256, 0, 28, 0);
+        assert_eq!(compute_mip_drop(&medium, 3), 2);
+
+        // Tiny textures (<= 64 px) stay untouched so LUTs/icons are never crushed to 1x1.
+        assert_eq!(compute_mip_drop(&tex2d(64, 64, 7, 28, 0), 3), 0);
+        assert_eq!(compute_mip_drop(&tex2d(4, 4, 3, 71, 0), 3), 0);
+
+        // BC texture whose halved extent is not a multiple of 4 (132 >> 1 = 66) cannot drop.
+        assert_eq!(compute_mip_drop(&tex2d(132, 132, 8, 98, 0), 2), 0);
+
+        // Render targets, depth-stencil, UAVs, MSAA, single-mip, and buffers are exempt.
+        assert_eq!(compute_mip_drop(&tex2d(2048, 2048, 10, 28, 1), 2), 0);
+        assert_eq!(compute_mip_drop(&tex2d(2048, 2048, 10, 45, 2), 2), 0);
+        assert_eq!(compute_mip_drop(&tex2d(2048, 2048, 10, 28, 4), 2), 0);
+        assert_eq!(compute_mip_drop(&tex2d(2048, 2048, 1, 71, 0), 2), 0);
+        let mut msaa = tex2d(1024, 1024, 4, 28, 0);
+        msaa.sample_count = 4;
+        assert_eq!(compute_mip_drop(&msaa, 2), 0);
+        assert_eq!(compute_mip_drop(&buffer(1 << 20), 2), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn subresource_remapping_drops_top_mips_and_preserves_slices() {
+        // 2D array: 7 guest mips, drop 2 => 5 host mips per slice.
+        assert_eq!(remap_subresource(0, 7, 2, false), None);
+        assert_eq!(remap_subresource(1, 7, 2, false), None);
+        assert_eq!(remap_subresource(2, 7, 2, false), Some(0));
+        assert_eq!(remap_subresource(6, 7, 2, false), Some(4));
+        // Slice 1 starts at guest subresource 7 => host subresource 5.
+        assert_eq!(remap_subresource(7, 7, 2, false), None);
+        assert_eq!(remap_subresource(8, 7, 2, false), None);
+        assert_eq!(remap_subresource(9, 7, 2, false), Some(5));
+        assert_eq!(remap_subresource(13, 7, 2, false), Some(9));
+
+        // 3D texture: 7 guest mips, drop 2.
+        assert_eq!(remap_subresource(0, 7, 2, true), None);
+        assert_eq!(remap_subresource(2, 7, 2, true), Some(0));
+        assert_eq!(remap_subresource(6, 7, 2, true), Some(4));
+        assert_eq!(remap_subresource(7, 7, 2, true), None);
+
+        // Zero drop is identity.
+        assert_eq!(remap_subresource(5, 7, 0, false), Some(5));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn oom_retry_escalates_pressure_and_recovers() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        let desc = tex2d(2048, 2048, 10, 71, 0);
+        let pressure = AtomicU32::new(0);
+        let mut attempts = Vec::new();
+        let res = allocate_with_oom_retry(
+            &desc,
+            0,
+            &pressure,
+            |&e: &i32| e == E_OUTOFMEMORY,
+            |drop| {
+                attempts.push(drop);
+                if drop == 0 {
+                    Err(E_OUTOFMEMORY)
+                } else {
+                    Ok(2048u64 >> drop)
+                }
+            },
+        );
+        assert_eq!(res, Ok((1024, 1)));
+        assert_eq!(attempts, vec![0, 1]);
+        assert_eq!(pressure.load(Relaxed), 1);
+
+        // Non-OOM errors do not retry or raise pressure.
+        let pressure2 = AtomicU32::new(0);
+        let err = allocate_with_oom_retry(
+            &desc,
+            0,
+            &pressure2,
+            |&e: &i32| e == E_OUTOFMEMORY,
+            |_| Err::<u64, i32>(E_INVALIDARG),
+        );
+        assert_eq!(err, Err((E_INVALIDARG, 0)));
+        assert_eq!(pressure2.load(Relaxed), 0);
+
+        // Render targets are exempt and never raise pressure even on OOM.
+        let rt = tex2d(2048, 2048, 10, 28, 1);
+        let pressure3 = AtomicU32::new(0);
+        let err = allocate_with_oom_retry(
+            &rt,
+            0,
+            &pressure3,
+            |&e: &i32| e == E_OUTOFMEMORY,
+            |_| Err::<u64, i32>(E_OUTOFMEMORY),
+        );
+        assert_eq!(err, Err((E_OUTOFMEMORY, 0)));
+        assert_eq!(pressure3.load(Relaxed), 0);
     }
 }

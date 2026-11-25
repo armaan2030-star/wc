@@ -90,6 +90,8 @@ mod intersect_tests;
 pub mod host;
 mod lower;
 mod own_bits;
+#[cfg(all(test, windows))]
+mod permlane_tests;
 mod rect;
 mod sampler;
 mod shader;
@@ -299,6 +301,23 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    match emit_forms(c, native, p, st, io, res) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::ONLY_DATA => {
+            lower::with_measured_descriptors(|| emit_forms(c, native, p, st, io, res))
+        }
+        r => r,
+    }
+}
+
+/// [`emit`]: the program, and where it is refused, its other forms.
+fn emit_forms(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

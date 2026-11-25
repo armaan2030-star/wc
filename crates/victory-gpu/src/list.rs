@@ -846,10 +846,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
-        if let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
-            crate::resource::host_resource(src),
+        if let (Some(dst_copy), Some(src_copy)) = (
+            crate::resource::host_copy(dst),
+            crate::resource::host_copy(src),
         ) {
+            let (to, from) = (&dst_copy.texture, &src_copy.texture);
             if unlike(dst, src) {
                 return;
             }
@@ -863,11 +864,88 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.twin_use(src, false, false);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            if dst_copy.mip_drop() == 0 && src_copy.mip_drop() == 0 {
+                crate::texture::host_written(dst);
+                // SAFETY: an open list and live textures.
+                unsafe { list.list.CopyResource(to, from) };
+            } else {
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_TEXTURE_COPY_LOCATION,
+                    D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                };
+                // SAFETY: live textures.
+                let (a, b) = unsafe { (to.GetDesc(), from.GetDesc()) };
+                if a.Dimension == b.Dimension
+                    && a.Width == b.Width
+                    && a.Height == b.Height
+                    && a.DepthOrArraySize == b.DepthOrArraySize
+                    && a.MipLevels == b.MipLevels
+                {
+                    crate::texture::host_written(dst);
+                    // SAFETY: an open list and matching live textures.
+                    unsafe { list.list.CopyResource(to, from) };
+                } else {
+                    // Copy the overlapping surviving mip levels subresource by
+                    // subresource so differing mip-drop counts never invalidate
+                    // the host command list, and only mark the subresources
+                    // actually written as host-owned so untouched upper mips
+                    // remain eligible for title-memory upload.
+                    let start = dst_copy.mip_drop().max(src_copy.mip_drop());
+                    let end = dst_copy.title_mips().min(src_copy.title_mips());
+                    let slices = if a.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                        1
+                    } else {
+                        u32::from(a.DepthOrArraySize.min(b.DepthOrArraySize))
+                    };
+                    for slice in 0..slices {
+                        for m in start..end {
+                            let Some(dst_sub) =
+                                dst_copy.host_subresource(slice * dst_copy.title_mips() + m)
+                            else {
+                                continue;
+                            };
+                            let Some(src_sub) =
+                                src_copy.host_subresource(slice * src_copy.title_mips() + m)
+                            else {
+                                continue;
+                            };
+                            let dst_mip = dst_sub % dst_copy.host_mips();
+                            let src_mip = src_sub % src_copy.host_mips();
+                            let dst_w = (a.Width >> dst_mip).max(1);
+                            let dst_h = (u64::from(a.Height) >> dst_mip).max(1);
+                            let src_w = (b.Width >> src_mip).max(1);
+                            let src_h = (u64::from(b.Height) >> src_mip).max(1);
+                            if (dst_w, dst_h) != (src_w, src_h) {
+                                continue;
+                            }
+                            let to_loc = D3D12_TEXTURE_COPY_LOCATION {
+                                // SAFETY: borrowed pointer never released by the location.
+                                pResource: unsafe { std::mem::transmute_copy(to) },
+                                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                                    SubresourceIndex: dst_sub,
+                                },
+                            };
+                            let from_loc = D3D12_TEXTURE_COPY_LOCATION {
+                                // SAFETY: borrowed pointer never released by the location.
+                                pResource: unsafe { std::mem::transmute_copy(from) },
+                                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                                    SubresourceIndex: src_sub,
+                                },
+                            };
+                            crate::texture::host_written_subresource(dst, dst_sub);
+                            // SAFETY: an open list and matching subresources.
+                            unsafe {
+                                list.list
+                                    .CopyTextureRegion(&to_loc, 0, 0, 0, &from_loc, None)
+                            };
+                        }
+                    }
+                }
+            }
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -918,7 +996,7 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
+        let Some(dst_copy) = crate::resource::host_copy(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
             // title's buffer (`HostList::defer_read_back`).
@@ -952,6 +1030,19 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
+        let to = &dst_copy.texture;
+        let mut to_location = dst;
+        if dst.kind != FOOTPRINT && dst_copy.mip_drop() > 0 {
+            let console_sub = dst.footprint.offset as u32;
+            let Some(host_sub) = dst_copy.host_subresource(console_sub) else {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::debug!("skipping CopyTextureRegion targeting dropped top mip")
+                });
+                return;
+            };
+            to_location.footprint.offset = u64::from(host_sub);
+        }
         if unlike(dst.resource, src.resource) {
             return;
         }
@@ -981,9 +1072,21 @@ extern "system" fn copy_texture_region(
             }
             _upload = buffer;
         } else {
-            let Some(texture) = crate::resource::host_resource(src.resource) else {
+            let Some(src_copy) = crate::resource::host_copy(src.resource) else {
                 return;
             };
+            let texture = &src_copy.texture;
+            if src_copy.mip_drop() > 0 {
+                let console_sub = src.footprint.offset as u32;
+                let Some(host_sub) = src_copy.host_subresource(console_sub) else {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::debug!("skipping CopyTextureRegion reading dropped top mip")
+                    });
+                    return;
+                };
+                from.footprint.offset = u64::from(host_sub);
+            }
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
@@ -996,7 +1099,6 @@ extern "system" fn copy_texture_region(
         list.twin_use(dst.resource, false, true);
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
-        let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
@@ -1128,11 +1230,18 @@ extern "system" fn resolve(
 ) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
-        && let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
-            crate::resource::host_resource(src),
+        && let (Some(dst_copy), Some(src_copy)) = (
+            crate::resource::host_copy(dst),
+            crate::resource::host_copy(src),
         )
     {
+        let Some(dst_sub) = dst_copy.host_subresource(dst_sub) else {
+            return;
+        };
+        let Some(src_sub) = src_copy.host_subresource(src_sub) else {
+            return;
+        };
+        let (to, from) = (&dst_copy.texture, &src_copy.texture);
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
@@ -1155,8 +1264,16 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
+            let dst_mips = u32::from(a.MipLevels).max(1);
+            let src_mips = u32::from(b.MipLevels).max(1);
+            let dst_mip = dst_sub % dst_mips;
+            let src_mip = src_sub % src_mips;
+            let dst_w = (a.Width >> dst_mip).max(1);
+            let dst_h = (u64::from(a.Height) >> dst_mip).max(1);
+            let src_w = (b.Width >> src_mip).max(1);
+            let src_h = (u64::from(b.Height) >> src_mip).max(1);
             let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            if (dst_w, dst_h) == (src_w, src_h) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -1164,8 +1281,8 @@ extern "system" fn resolve(
                 let rect = RECT {
                     left: 0,
                     top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
+                    right: dst_w.min(src_w) as i32,
+                    bottom: dst_h.min(src_h) as i32,
                 };
                 list1.ResolveSubresourceRegion(
                     to,
