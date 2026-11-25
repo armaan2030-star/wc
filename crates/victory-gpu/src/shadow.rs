@@ -103,6 +103,28 @@ struct Card {
     size: u64,
 }
 
+/// Whether a refresh compares the pages the title wrote with the copy and
+/// puts in only the 4 KiB pieces that differ (`VICTORY_COPY_COMPARE=1`; off
+/// by default). The write watch tells which pages were written, not whether
+/// their bytes changed; in a still scene the title writes 100-150 MB a
+/// frame of its buffers again, and for a copy in the card's memory every
+/// such byte went up and was hashed there again. With the switch a piece
+/// written with the bytes it held stays as it is: not copied, not sent up.
+pub(crate) fn copy_compare() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_COMPARE").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line (diagnostics): the 64 KiB pages refreshes
+/// copied from title memory, each once, and the bytes copied in all.
+#[cfg(feature = "diagnostics")]
+pub(crate) static COPIED_PAGES: Mutex<Option<(std::collections::HashSet<usize>, u64)>> = Mutex::new(None);
+
+/// Since the last frame-rate line, with [`copy_compare`]: bytes the title
+/// wrote that a refresh compared, and of them those that held what the
+/// copy held (not put in, not sent up).
+pub(crate) static COPY_COMPARED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Whether the host copies of big title buffers are in the card's own
 /// memory (on by default since run 75 showed it holds: the BVH skinning
 /// list went from 50.5 to 4.5 ms on the card; `VICTORY_CARD_BUFFERS=0`
@@ -1584,16 +1606,34 @@ pub(crate) fn let_go_idle() {
             return;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        // A window may be stored under multiple keys in `LOOSE`, so its
+        // map-only refcount equals the number of keys pointing to it.
+        let mut counts: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::with_capacity(map.len());
+        for s in map.values() {
+            *counts.entry(Arc::as_ptr(s) as usize).or_insert(0) += 1;
+        }
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
+                let ptr = Arc::as_ptr(s) as usize;
+                Arc::strong_count(s) == counts[&ptr]
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
+                    && !s.writes_pending()
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let mut seen = std::collections::HashSet::new();
+        let mut unique = Vec::new();
+        for key in idle {
+            if let Some(s) = map.remove(&key)
+                && seen.insert(Arc::as_ptr(&s) as usize)
+            {
+                unique.push(s);
+            }
+        }
+        unique
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -1607,6 +1647,42 @@ pub(crate) fn let_go_idle() {
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
         crate::host::retire(shadow);
+    }
+    // Also evict idle host copies of registered title buffers (including
+    // carded VRAM copies): title memory stays authoritative once no flight
+    // is writing to the buffer, so the next use recreates the copy cleanly.
+    let buffers_idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let gone_buffers: Vec<Arc<Shadow>> = {
+        let mut map = buffers();
+        let mut out = Vec::new();
+        for entry in map.values_mut() {
+            let idle = entry.shadow.as_ref().is_some_and(|s| {
+                Arc::strong_count(s) == 1
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), buffers_idle_ms, IDLE_FRAMES)
+                    && crate::host::references(&s.buffer) == 1
+                    && !s.writes_pending()
+            });
+            if idle && let Some(s) = entry.shadow.take() {
+                out.push(s);
+            }
+        }
+        out
+    };
+    if !gone_buffers.is_empty() {
+        let (went, bytes) = (
+            gone_buffers.len(),
+            gone_buffers.iter().map(|s| s.len).sum::<u64>(),
+        );
+        crate::host::trail(|| {
+            format!("sweep: {went} host copies of title buffers let go ({} KiB), held by no list and no slot", bytes >> 10)
+        });
+        for shadow in gone_buffers {
+            crate::host::retire(shadow);
+        }
+        CARDED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|w| w.strong_count() > 0);
     }
 }
 
@@ -1964,6 +2040,8 @@ impl Shadow {
                 if differs != 0 {
                     crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    #[cfg(feature = "diagnostics")]
+                    crate::watch::ours(start + at, n);
                     written += n;
                 }
             }
@@ -2053,6 +2131,8 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        #[cfg(feature = "diagnostics")]
+        crate::watch::ours(start + at, n);
         n
     }
 
@@ -2464,6 +2544,16 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        #[cfg(feature = "diagnostics")]
+        if from < to {
+            let mut c = COPIED_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+            let (pages, bytes) = c.get_or_insert_with(|| (std::collections::HashSet::new(), 0));
+            pages.extend(from / crate::watch::PAGE..to.div_ceil(crate::watch::PAGE));
+            *bytes += (to - from) as u64;
+        }
+        if from < to && copy_compare() {
+            return self.copy_compared(from, to);
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -2471,6 +2561,47 @@ impl Shadow {
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
+    }
+
+    /// [`Shadow::copy`] with [`copy_compare`]: title memory `[from, to)` is
+    /// read into scratch memory, and only the 4 KiB pieces that differ from
+    /// the copy are put in and noted changed (for snapshots and for the
+    /// card's side). Returns the bytes that differed.
+    fn copy_compared(&self, from: usize, to: usize) -> usize {
+        const PIECE: usize = 4096;
+        let start = self.start as usize;
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        SCRATCH.with(|s| {
+            let mut title = s.borrow_mut();
+            title.clear();
+            title.resize(to - from, 0);
+            crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+            // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
+            let (mut changed, mut run): (usize, Option<usize>) = (0, None);
+            let mut at = 0;
+            while at <= title.len() {
+                let end = (at + PIECE).min(title.len());
+                let differs = at < title.len() && title[at..end] != held[at..end];
+                if differs {
+                    run.get_or_insert(at);
+                } else if let Some(first) = run.take() {
+                    held[first..at].copy_from_slice(&title[first..at]);
+                    self.changed(from - start + first, from - start + at);
+                    self.card_changed(from - start + first, from - start + at);
+                    changed += at - first;
+                }
+                if at == title.len() {
+                    break;
+                }
+                at = end;
+            }
+            COPY_COMPARED[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+            COPY_COMPARED[1].fetch_add((to - from - changed) as u64, Ordering::Relaxed);
+            changed
+        })
     }
 
     /// Whether shaders read and write this copy in the card's own memory
@@ -2581,6 +2712,8 @@ impl Shadow {
             if differs != 0 {
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                #[cfg(feature = "diagnostics")]
+                crate::watch::ours(start + at, n);
                 written = n;
             }
         } else {
@@ -2611,6 +2744,16 @@ impl Shadow {
     /// a copy has no other use for), as [`Shadow::merge_under_writes`].
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
+    /// With [`relay`]: whether title bytes in `[lo, hi)` of this copy went
+    /// up with a send after `after` (their merge leaves them out).
+    pub(crate) fn card_sent_after(&self, lo: usize, hi: usize, after: u64) -> bool {
+        let Some(card) = &self.card else {
+            return false;
+        };
+        let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+        sent.iter().any(|s| s.2 > after && s.0 < hi && s.1 > lo)
+    }
+
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
@@ -2656,6 +2799,8 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        #[cfg(feature = "diagnostics")]
+        crate::watch::ours(start + at, n);
         n
     }
 }

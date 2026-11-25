@@ -244,22 +244,27 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// (NVIDIA) refused the whole texture, so every pass that wrote it drew
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
+/// The Series S profile also renders light to R9G9B9E5 (67) targets with
+/// unordered access (full screen), which NVIDIA refuses as well (the device
+/// was removed in the menus): there R11G11B10_FLOAT (26) stands in, three
+/// unsigned floats of 4 bytes, the same range within 0.2%, with 6 and 5
+/// bits of mantissa instead of 9.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 26)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
-            STAND_INS.map(|(f, _)| {
+            STAND_INS.map(|(f, to)| {
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -279,7 +284,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(format = f, stand_in = to, "the host does not render to this format: a stand-in format of the same channels does");
                 }
                 refused
             })
@@ -1442,15 +1447,27 @@ pub(crate) fn let_go_idle() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
-            continue;
+        let title_filled = fills(&r.desc) && !crate::texture::host_wrote(at);
+        if !title_filled {
+            // Render targets / depth / UAV textures hold GPU-rendered contents
+            // and are kept while their backing memory is live. Only evict a
+            // placed one once the title has unmapped its backing pages.
+            let unmapped_placed = r.host.placed.load(Relaxed)
+                && !crate::texture::committed(r.data().cast_const(), 1);
+            if !unmapped_placed {
+                continue;
+            }
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
+            let idle = made.as_ref().is_some_and(|(host, twin)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
+                    && twin.as_ref().is_none_or(|t| {
+                        std::sync::Arc::strong_count(t) == 1
+                            && crate::host::references(&t.colour.texture) == 1
+                    })
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -1461,16 +1478,21 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
+        if let Some((host, twin)) = gone {
             r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+            if title_filled {
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+            }
             went += 1;
-            bytes += host.bytes;
+            bytes += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
             if first.is_none() {
                 first = Some(at);
             }
             crate::host::retire(host);
+            if let Some(twin) = twin {
+                crate::host::retire(twin);
+            }
         }
     }
     if went > 0 {
