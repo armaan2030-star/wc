@@ -100,8 +100,8 @@ fn buddies(a: u64, b: u64) -> bool {
 pub(crate) enum Sym {
     Unknown,
     K(u32),
-    /// The lane's own value of a VGPR value from before the section.
-    Own(Value),
+    /// Lane `lane`'s value of a VGPR value from before the section.
+    Lane(Value, u32),
     /// A uniform value from before the section.
     Uni(Value),
     /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
@@ -336,10 +336,26 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             }
             continue;
         }
-        let Fields::Valu(v) = &inst.fields else {
-            for &(_, w) in &inst.writes {
-                vec.insert(w, vec![Sym::Unknown; wave as usize]);
+        let mark_unknown = |inst: &Inst,
+                            skip: &[Value],
+                            vec: &mut HashMap<Value, Vec<Sym>>,
+                            uni: &mut HashMap<Value, Sym>| {
+            for &(reg, w) in &inst.writes {
+                if skip.contains(&w) {
+                    continue;
+                }
+                match reg {
+                    Reg::V(_) => {
+                        vec.insert(w, vec![Sym::Unknown; wave as usize]);
+                    }
+                    _ => {
+                        uni.insert(w, Sym::Unknown);
+                    }
+                }
             }
+        };
+        let Fields::Valu(v) = &inst.fields else {
+            mark_unknown(inst, &[], &mut vec, &mut uni);
             continue;
         };
         let lanes = |op: &Operand,
@@ -352,7 +368,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Some(x) => vec
                         .get(&x)
                         .cloned()
-                        .unwrap_or_else(|| (0..wave).map(|_| Sym::Own(x)).collect()),
+                        .unwrap_or_else(|| (0..wave).map(|l| Sym::Lane(x, l)).collect()),
                     None => one(Sym::Unknown),
                 },
                 Operand::Scalar { code, .. } if code != NULL => match inst.read(Reg::S(code)) {
@@ -369,6 +385,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             let (Some(Operand::Scalar { code, .. }), Some(src), Some(lane)) =
                 (v.dst, v.src.first(), v.src.get(1))
             else {
+                mark_unknown(inst, &[], &mut vec, &mut uni);
                 continue;
             };
             let l = match *lane {
@@ -382,6 +399,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     .and_then(|l| x.get(l as usize).copied())
                     .unwrap_or(Sym::Unknown);
                 uni.insert(w, s);
+                mark_unknown(inst, &[w], &mut vec, &mut uni);
+            } else {
+                mark_unknown(inst, &[], &mut vec, &mut uni);
             }
             continue;
         }
@@ -507,15 +527,15 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             }
             vec.insert(dst_lo, out_lo);
             vec.insert(dst_hi, out_hi);
+            mark_unknown(inst, &[dst_lo, dst_hi], &mut vec, &mut uni);
             continue;
         }
         let Some(Operand::Vector { reg: dreg, .. }) = v.dst else {
-            for &(_, w) in &inst.writes {
-                uni.insert(w, Sym::Unknown);
-            }
+            mark_unknown(inst, &[], &mut vec, &mut uni);
             continue;
         };
         let Some(dst) = inst.write(Reg::V(dreg)) else {
+            mark_unknown(inst, &[], &mut vec, &mut uni);
             continue;
         };
         let old = lanes(
@@ -532,7 +552,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
         let fetched: Option<Vec<Sym>> = match (v.dpp, &src0) {
             (Some(d), Some(s)) => {
                 if exec != all {
-                    vec.insert(dst, vec![Sym::Unknown; wave as usize]);
+                    mark_unknown(inst, &[], &mut vec, &mut uni);
                     continue;
                 }
                 let mut f = Vec::with_capacity(wave as usize);
@@ -572,7 +592,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 let b = src(1).unwrap_or_default();
                 (0..wave as usize)
                     .map(|l| match (a[l], b.get(l).copied(), mask) {
-                        (Sym::K(ident), Some(Sym::Own(x)), Some(m)) if masked.contains(&m) => {
+                        (Sym::K(ident), Some(Sym::Lane(x, src_l)), Some(m))
+                            if src_l == l as u32 && masked.contains(&m) =>
+                        {
                             Sym::Red {
                                 op: None,
                                 src: x,
@@ -663,6 +685,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             })
             .collect();
         vec.insert(dst, merged);
+        mark_unknown(inst, &[dst], &mut vec, &mut uni);
     }
     shapes(vec, uni, wave)
 }
@@ -702,7 +725,7 @@ fn shapes(
     let mut out = HashMap::new();
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
-        Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
+        Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
             op: Some(op),
             src,
@@ -749,10 +772,18 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     {
         return Some(Shape::Masked(m.0, m.1, m.2));
     }
+    if let Sym::Lane(x, 0) = first
+        && lanes
+            .iter()
+            .enumerate()
+            .all(|(l, &s)| s == Sym::Lane(x, l as u32))
+    {
+        return Some(Shape::Value(x));
+    }
     if lanes.iter().all(|&s| s == first) {
         return match first {
             Sym::K(k) => Some(Shape::K(k)),
-            Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
+            Sym::Uni(x) => Some(Shape::Value(x)),
             Sym::Red {
                 op: Some(op),
                 src,
@@ -1224,5 +1255,72 @@ mod tests {
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
         }
+    }
+
+    #[test]
+    fn readlane_and_dpp_swizzle_of_pre_section_vgpr_preserve_lane_provenance() {
+        let save = sop1(4, 0x25, 193); // s_or_saveexec_b64 s[4:5], -1
+        let restore = sop1(EXEC, 0x04, 4); // s_mov_b64 exec, s[4:5]
+
+        // (a) v_readlane_b32 s7, v0, 0 inside a whole-wave section reads lane 0
+        //     of a vector VGPR v0 into s7; it must NOT collapse to Shape::Value(v0).
+        //     (Prefix with a vector write to v0 so `ir::build` does not treat v0
+        //     as a parked-scalar VGPR.)
+        let make_vec = vop2(0, 0x03, 256, 0); // v_add_f32 v0, v0, v0
+        let readlane = vop3(7, 0x360, 256, 128, 0);
+        let w_readlane = [make_vec, save, readlane[0], readlane[1], restore];
+        let p = build(&w_readlane, true);
+        assert_eq!(p.blocks[0].insts[2].name(), "v_readlane_b32");
+        let s7 = p.blocks[0].insts[2].write(Reg::S(7)).unwrap();
+        assert_eq!(sections(&p, 0)[&1].shapes.get(&s7), None);
+
+        // (b) v_mov_b32 v1, v0 dpp8:[1,0,3,2,5,4,7,6] swaps neighbour lanes;
+        //     neither v1 nor a subsequent v_cndmask_b32 with v1 may erase the swizzle.
+        let cnd = vop3(2, 0x101, 128, 257, 4);
+        let w_dpp = [
+            save,
+            vop1(1, 0x01, 0xE9),
+            0xDE54_C100, // dpp8:[1,0,3,2,5,4,7,6] on v0
+            cnd[0],
+            cnd[1],
+            restore,
+        ];
+        let p = build(&w_dpp, true);
+        let v1 = p.blocks[0].insts[1].write(Reg::V(1)).unwrap();
+        let v2 = p.blocks[0].insts[2].write(Reg::V(2)).unwrap();
+        let sec = &sections(&p, 0)[&0];
+        assert_eq!(sec.shapes.get(&v1), None);
+        assert_eq!(sec.shapes.get(&v2), None);
+
+        // (c) Identity v_mov_b32 v1, v0 (same lane to same lane) still yields Shape::Value(v0).
+        let w_id = [save, vop1(1, 0x01, 256), restore];
+        let p = build(&w_id, true);
+        let v0 = p
+            .inputs
+            .iter()
+            .find_map(|&(r, v)| (r == Reg::V(0)).then_some(v))
+            .unwrap();
+        let v1 = p.blocks[0].insts[1].write(Reg::V(1)).unwrap();
+        assert_eq!(sections(&p, 0)[&0].shapes.get(&v1), Some(&Shape::Value(v0)));
+    }
+
+    #[test]
+    fn valu_secondary_writes_are_invalidated_as_unknown() {
+        // v_add_co_u32 v1, s[8:9], v0, v0 writes primary v1 AND secondary s[8:9]
+        // (carry out). A subsequent s_mov_b32 s10, s8 must NOT treat s8 as a
+        // pre-section uniform Value.
+        let w = [
+            sop1(4, 0x25, 193), // s_or_saveexec_b64 s[4:5], -1
+            0xD70F_0801,
+            256 | (256 << 9), // v_add_co_u32 v1, s[8:9], v0, v0
+            sop1(10, 0x03, 8), // s_mov_b32 s10, s8
+            sop1(EXEC, 0x04, 4), // s_mov_b64 exec, s[4:5]
+        ];
+        let p = build(&w, true);
+        let s8 = p.blocks[0].insts[1].write(Reg::S(8)).unwrap();
+        let s10 = p.blocks[0].insts[2].write(Reg::S(10)).unwrap();
+        let sec = &sections(&p, 0)[&0];
+        assert_eq!(sec.shapes.get(&s8), None);
+        assert_eq!(sec.shapes.get(&s10), None);
     }
 }
