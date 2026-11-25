@@ -182,7 +182,7 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
-    if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
+    if len == 0 || STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
     let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
@@ -295,13 +295,28 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     let mut v = views();
     if v.views.is_empty() {
         return;
     }
     let end = at.saturating_add(len);
-    let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
-    let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
+    let first = v
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, view)| base.saturating_add(view.0) > at)
+        .map(|(base, _)| *base);
+    let gone: Vec<usize> = first
+        .into_iter()
+        .chain(
+            v.views
+                .range(at.saturating_add(1)..end)
+                .map(|(base, _)| *base),
+        )
+        .collect();
     for base in gone {
         v.views.remove(&base);
     }
@@ -1166,5 +1181,19 @@ mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn views_gone_ignores_zero_length_without_panicking() {
+        let view = 0x7_9000_0000usize;
+        title_memory_view(view, K64, 7, 0);
+        // Zero-length removals (aligned and unaligned) must not panic in BTreeMap::range
+        // or drop the live view.
+        views_gone(view, 0);
+        views_gone(view + 1, 0);
+        views_gone(usize::MAX, 0);
+        assert!(views().views.contains_key(&view));
+        views_gone(view, K64);
+        assert!(!views().views.contains_key(&view));
     }
 }

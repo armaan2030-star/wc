@@ -559,6 +559,9 @@ fn uncommitted_end(block: usize) -> usize {
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
+    if start >= end {
+        return false;
+    }
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
         .protected
@@ -580,6 +583,9 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
@@ -639,6 +645,9 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -678,11 +687,14 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        let Some(end) = at.checked_add(1) else {
+            return EXCEPTION_CONTINUE_SEARCH;
+        };
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
-        if open(&mut g, at, at + 1) {
+        if open(&mut g, at, end) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -1054,6 +1066,51 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    #[test]
+    fn zero_length_remap_and_writing_do_not_panic_or_unguard() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        };
+        // SAFETY: pagefile-backed view of one guarded block for this test.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            view
+        };
+        let base = view.Value as usize;
+
+        crate::inplace::title_memory_view(base, BLOCK, 11, 0);
+        assert!(guard(base, base + BLOCK).is_some());
+        assert_eq!(guard(base, base + BLOCK), Some(Vec::new()));
+        assert!(guards().protected.contains(&(base / BLOCK)));
+
+        // Zero-length calls (even at unaligned addresses) must be strict no-ops.
+        title_memory_remapped(base, 0);
+        title_memory_remapped(base + 1, 0);
+        writing(base + 1, 0);
+        assert!(
+            guards().protected.contains(&(base / BLOCK)),
+            "zero-length calls must not unguard the block"
+        );
+        assert_eq!(guard(base, base + BLOCK), Some(Vec::new()));
+
+        // Clean up guarded state and view before unmapping.
+        title_memory_remapped(base, BLOCK);
+        // SAFETY: unmapping our own view.
+        unsafe { UnmapViewOfFile(view) };
     }
 }
 
