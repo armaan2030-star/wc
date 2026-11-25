@@ -105,6 +105,16 @@ struct KeyState {
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
+/// The mouse as the stand-in pad sees it: a right-stick deflection already
+/// worked out from the mouse's speed (up positive), and the two buttons.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Mouse {
+    look_x: f32,
+    look_y: f32,
+    left: bool,
+    right: bool,
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
@@ -113,27 +123,113 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Mouse-look for the stand-in pad; nothing unless a host provides it.
+    fn mouse(&mut self) -> Mouse {
+        Mouse::default()
+    }
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
+/// Mouse-look tuning: the speed (pixels per second) that gives a full stick,
+/// and the smallest deflection a moving mouse gives, so that slow movement
+/// clears the title's own stick dead zone.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LookTuning {
+    full_speed: f32,
+    floor: f32,
+}
+
+impl Default for LookTuning {
+    fn default() -> Self {
+        LookTuning {
+            full_speed: 1800.0,
+            floor: 0.22,
+        }
+    }
+}
+
+impl LookTuning {
+    /// `VICTORY_MOUSE_SPEED` (pixels/s for a full stick; lower is more
+    /// sensitive) and `VICTORY_MOUSE_FLOOR` (0 to 0.9).
+    fn from_env() -> LookTuning {
+        let read = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok());
+        let default = LookTuning::default();
+        LookTuning {
+            full_speed: read("VICTORY_MOUSE_SPEED")
+                .filter(|v| *v > 1.0)
+                .unwrap_or(default.full_speed),
+            floor: read("VICTORY_MOUSE_FLOOR")
+                .map(|v| v.clamp(0.0, 0.9))
+                .unwrap_or(default.floor),
+        }
+    }
+
+    /// One axis: mouse speed in pixels per second to a stick deflection.
+    fn axis(self, speed: f32) -> f32 {
+        // Below a couple of pixels a second is hand jitter, not a turn.
+        if speed.abs() < 2.0 {
+            return 0.0;
+        }
+        let amount = (speed.abs() / self.full_speed).min(1.0);
+        (self.floor + (1.0 - self.floor) * amount).copysign(speed)
+    }
+}
+
+/// Whether mouse-look lets the cursor go for the title's pause menu. Esc
+/// (which the stand-in pad also passes on as Menu) lets it go, and Esc again
+/// takes it back. A left click inside the window also takes it back, for a
+/// menu closed some other way (Backspace, or Resume). The click that takes
+/// the cursor back is not passed on as a trigger pull.
+#[derive(Clone, Copy, Debug, Default)]
+struct MenuGate {
+    free: bool,
+    esc: bool,
+    left: bool,
+    swallow: bool,
+}
+
+impl MenuGate {
+    /// One poll: the keys as they are now and whether the cursor is inside
+    /// the window. Returns whether the cursor is free and whether the left
+    /// button counts.
+    fn step(&mut self, esc: bool, left: bool, inside: bool) -> (bool, bool) {
+        let esc_pressed = esc && !self.esc;
+        let left_pressed = left && !self.left;
+        self.esc = esc;
+        self.left = left;
+        if esc_pressed {
+            self.free = !self.free;
+        } else if self.free && left_pressed && inside {
+            self.free = false;
+            self.swallow = true;
+        }
+        if !left {
+            self.swallow = false;
+        }
+        (self.free, !self.free && !self.swallow)
+    }
+}
+
+fn fallback(keys: &[KeyState], mouse: Mouse) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
-            1.0
+            1.0_f32
         } else {
             0.0
         }
     };
+    let button = |held: bool| if held { 1.0_f32 } else { 0.0 };
     PadState {
         buttons: FALLBACK_BUTTONS
             .iter()
             .filter(|(vk, _)| on(*vk) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
+        // Right mouse aims (left trigger), left mouse fires (right trigger).
+        left_trigger: on(b'Z').max(button(mouse.right)),
+        right_trigger: on(b'C').max(button(mouse.left)),
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        right_x: (on(b'L') - on(b'J') + mouse.look_x).clamp(-1.0, 1.0),
+        right_y: (on(b'I') - on(b'K') + mouse.look_y).clamp(-1.0, 1.0),
     }
 }
 
@@ -401,12 +497,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -451,6 +547,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: Mouse,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -458,7 +555,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys, mouse)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1084,8 +1181,13 @@ mod host {
         XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState,
         XInputSetState,
     };
+    use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_LBUTTON, VK_RBUTTON};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        ClipCursor, CreateCursor, GCLP_HCURSOR, GetClassNameW, GetCursorPos, GetForegroundWindow,
+        GetWindowRect, GetWindowThreadProcessId, IDC_ARROW, LoadCursorW, SetClassLongPtrW,
+        SetCursorPos,
     };
 
     use super::*;
@@ -1130,9 +1232,158 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        look: Look,
+    }
+
+    /// How far back mouse movement counts toward the stick. The title reads
+    /// input once a frame, and in the world a frame is a quarter second, so a
+    /// short flick between two of its frames must still be held long enough
+    /// to be seen.
+    const LOOK_WINDOW: Duration = Duration::from_millis(180);
+
+    /// Mouse-look: while the title's window is in front, the cursor is hidden
+    /// and held at the window's centre, and its movement turns into a
+    /// right-stick deflection. `VICTORY_MOUSE_LOOK=0` turns it off.
+    struct Look {
+        enabled: bool,
+        tuning: LookTuning,
+        /// The window we hold the cursor in, as an address.
+        window: Option<isize>,
+        blank: isize,
+        samples: VecDeque<(Instant, i32, i32)>,
+        menu: MenuGate,
+    }
+
+    /// The window's title bar, roughly: a click there (to move the window)
+    /// does not take the cursor back.
+    const TITLE_BAR: i32 = 40;
+
+    impl Default for Look {
+        fn default() -> Self {
+            let enabled = std::env::var("VICTORY_MOUSE_LOOK").map_or(true, |v| v.trim() != "0");
+            let tuning = LookTuning::from_env();
+            if enabled {
+                tracing::info!(?tuning, "mouse-look on (VICTORY_MOUSE_LOOK=0 turns it off)");
+            }
+            Look {
+                enabled,
+                tuning,
+                window: None,
+                blank: 0,
+                samples: VecDeque::new(),
+                menu: MenuGate::default(),
+            }
+        }
+    }
+
+    impl Look {
+        /// Our process's window when it is in front: the title's own window
+        /// (the title registers its own class) or ours, never a console.
+        fn ours() -> Option<HWND> {
+            if !focused() {
+                return None;
+            }
+            // SAFETY: plain queries into our buffer.
+            unsafe {
+                let window = GetForegroundWindow();
+                let mut name = [0u16; 64];
+                let n = GetClassNameW(window, name.as_mut_ptr(), name.len() as i32);
+                let class = String::from_utf16_lossy(&name[..n.max(0) as usize]);
+                (!class.is_empty() && !class.contains("Console")).then_some(window)
+            }
+        }
+
+        /// An all-transparent cursor, made once.
+        fn blank(&mut self) -> isize {
+            if self.blank == 0 {
+                let and = [0xFF_u8; 128];
+                let xor = [0_u8; 128];
+                // SAFETY: 32×32 masks of the sizes given.
+                self.blank = unsafe {
+                    CreateCursor(GetModuleHandleW(std::ptr::null()), 0, 0, 32, 32, and.as_ptr().cast(), xor.as_ptr().cast())
+                } as isize;
+            }
+            self.blank
+        }
+
+        /// Gives the cursor back: unclipped, and the window's arrow again.
+        fn release(&mut self) {
+            if let Some(window) = self.window.take() {
+                // SAFETY: plain calls; a closed window just fails.
+                unsafe {
+                    ClipCursor(std::ptr::null());
+                    SetClassLongPtrW(window as HWND, GCLP_HCURSOR, LoadCursorW(std::ptr::null_mut(), IDC_ARROW) as isize);
+                }
+                tracing::info!("mouse-look released");
+            }
+            self.samples.clear();
+        }
+
+        fn read(&mut self) -> Mouse {
+            let Some(window) = (self.enabled).then(Look::ours).flatten() else {
+                self.release();
+                return Mouse::default();
+            };
+            let mut rect = RECT::default();
+            // SAFETY: plain queries and calls on our own window.
+            unsafe {
+                if GetWindowRect(window, &mut rect) == 0 || rect.right - rect.left < 64 {
+                    return Mouse::default();
+                }
+                let (cx, cy) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+                let mut at = POINT::default();
+                GetCursorPos(&mut at);
+                let inside = at.x >= rect.left
+                    && at.x < rect.right
+                    && at.y >= rect.top + TITLE_BAR
+                    && at.y < rect.bottom;
+                let esc = GetAsyncKeyState(i32::from(VK_ESCAPE)) < 0;
+                let left_down = GetAsyncKeyState(i32::from(VK_LBUTTON)) < 0;
+                let was_free = self.menu.free;
+                let (free, left_counts) = self.menu.step(esc, left_down, inside);
+                if free != was_free {
+                    tracing::info!(free, "mouse-look: pause menu toggle (Esc; a click takes the cursor back)");
+                }
+                if free {
+                    self.release();
+                    return Mouse::default();
+                }
+                ClipCursor(&rect);
+                if self.window != Some(window as isize) {
+                    self.release();
+                    SetClassLongPtrW(window, GCLP_HCURSOR, self.blank());
+                    SetCursorPos(cx, cy);
+                    self.window = Some(window as isize);
+                    tracing::info!("mouse-look holding the cursor");
+                    return Mouse::default();
+                }
+                let (dx, dy) = (at.x - cx, at.y - cy);
+                if dx != 0 || dy != 0 {
+                    SetCursorPos(cx, cy);
+                }
+                let now = Instant::now();
+                self.samples.push_back((now, dx, dy));
+                while self.samples.front().is_some_and(|(t, ..)| now - *t > LOOK_WINDOW) {
+                    self.samples.pop_front();
+                }
+                let span = LOOK_WINDOW.as_secs_f32();
+                let (sx, sy) = self.samples.iter().fold((0, 0), |(x, y), (_, dx, dy)| (x + dx, y + dy));
+                Mouse {
+                    look_x: self.tuning.axis(sx as f32 / span),
+                    // Screen y grows downward; stick up is positive.
+                    look_y: self.tuning.axis(-sy as f32 / span),
+                    left: left_counts && left_down,
+                    right: GetAsyncKeyState(i32::from(VK_RBUTTON)) < 0,
+                }
+            }
+        }
     }
 
     impl Source for Host {
+        fn mouse(&mut self) -> Mouse {
+            self.look.read()
+        }
+
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
@@ -1625,5 +1876,56 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::*;
+
+    #[test]
+    fn mouse_speed_maps_to_a_stick_past_the_dead_zone() {
+        let t = LookTuning { full_speed: 1000.0, floor: 0.2 };
+        assert_eq!(t.axis(0.0), 0.0);
+        assert_eq!(t.axis(1.0), 0.0, "jitter is ignored");
+        assert!((t.axis(500.0) - 0.6).abs() < 1e-6);
+        assert!((t.axis(-500.0) + 0.6).abs() < 1e-6);
+        assert_eq!(t.axis(5000.0), 1.0);
+        assert_eq!(t.axis(-5000.0), -1.0);
+        // Slow but real movement still clears the floor.
+        assert!(t.axis(10.0) >= 0.2);
+    }
+
+    #[test]
+    fn esc_frees_the_cursor_and_esc_or_a_click_takes_it_back() {
+        let mut g = MenuGate::default();
+        assert_eq!(g.step(false, false, true), (false, true), "held at start");
+        assert_eq!(g.step(true, false, true), (true, false), "Esc opens the menu: free");
+        assert_eq!(g.step(true, false, true), (true, false), "holding Esc changes nothing");
+        assert_eq!(g.step(false, false, true), (true, false));
+        assert_eq!(g.step(true, false, true), (false, true), "Esc again: held");
+        assert_eq!(g.step(false, false, true), (false, true));
+        // Free again, then a click outside the window does nothing...
+        g.step(true, false, true);
+        g.step(false, false, false);
+        assert_eq!(g.step(false, true, false), (true, false));
+        g.step(false, false, false);
+        // ...and a click inside takes the cursor back without firing.
+        assert_eq!(g.step(false, true, true), (false, false), "the click is swallowed");
+        assert_eq!(g.step(false, true, true), (false, false), "still the same click");
+        assert_eq!(g.step(false, false, true), (false, true));
+        assert_eq!(g.step(false, true, true), (false, true), "the next click fires");
+    }
+
+    #[test]
+    fn mouse_drives_the_stand_in_pad() {
+        let mouse = Mouse { look_x: 0.5, look_y: -0.25, left: true, right: true };
+        let pad = fallback(&[], mouse);
+        assert_eq!((pad.right_x, pad.right_y), (0.5, -0.25));
+        assert_eq!((pad.left_trigger, pad.right_trigger), (1.0, 1.0));
+        // Keys and mouse add up but stay a stick.
+        let l = KeyState { virtual_key: b'L', ..Default::default() };
+        assert_eq!(fallback(&[l], mouse).right_x, 1.0);
+        assert_eq!(fallback(&[], Mouse::default()), PadState::default());
     }
 }

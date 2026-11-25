@@ -66,6 +66,36 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The hash found a change the view-memory guard had not seen: the
+    /// texture is written in a way the guard misses (a video frame the title
+    /// decodes into a ring of textures), so it is hashed at every check.
+    unguarded: bool,
+    /// Checks in a row an unguarded texture's hash stayed the same; past
+    /// `STILL_CHECKS` it goes back to the guard (the video ended).
+    still: u32,
+    /// A cheap fingerprint of an unguarded texture (`sample`): unchanged,
+    /// the whole hash is skipped between the every-eighth-frame checks.
+    sample: Option<u64>,
+}
+
+/// About three seconds at 30 fps.
+const STILL_CHECKS: u32 = 90;
+
+/// A fingerprint of 1024 slices of 16 bytes spread over the texture. A video
+/// frame changes nearly every slice; a change it misses is still found by the
+/// whole hash at the texture's every-eighth-frame turn.
+fn sample(bytes: &[u8]) -> u64 {
+    const SLICES: usize = 1024;
+    const SLICE: usize = 16;
+    let step = (bytes.len() / SLICES).max(SLICE);
+    let mut hasher = blake3::Hasher::new();
+    let mut at = 0;
+    while at + SLICE <= bytes.len() {
+        hasher.update(&bytes[at..at + SLICE]);
+        at += step;
+    }
+    let hash = hasher.finalize();
+    u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -75,6 +105,10 @@ unsafe impl Send for Staging {}
 unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+
+/// Textures hashed at every check now, written past the view-memory guard
+/// (`Last::unguarded`).
+pub(crate) static UNGUARDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
@@ -708,18 +742,58 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        //
+        // A texture whose hash once changed while the guard saw no write is
+        // hashed at every check from then on (`Last::unguarded`). Otherwise
+        // a ring of video frames, each looked at every eighth frame only,
+        // showed frames out of order: the front end's loading montage
+        // jumped back in a third of its frames.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut guard_saw_none = false;
+        let mut hash_turn = true;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
+            guard_saw_none = unwritten;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            hash_turn = turn;
+            if unwritten && !turn && !last.unguarded {
                 return 0;
             }
         }
+        let note_same = |last: &mut Last| {
+            if last.unguarded {
+                last.still += 1;
+                if last.still >= STILL_CHECKS {
+                    last.unguarded = false;
+                    last.still = 0;
+                    UNGUARDED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(address = format_args!("{start:#x}"), size, "texture unchanged for a while: guarded again");
+                }
+            }
+        };
+        // An unguarded texture whose fingerprint is as it was, off its turn:
+        // taken as unchanged without hashing it whole.
+        let same_sample = |last: &mut Last, tiled: &[u8]| {
+            if !last.unguarded {
+                return false;
+            }
+            let now = sample(tiled);
+            let same = !hash_turn && last.sample == Some(now);
+            last.sample = Some(now);
+            same
+        };
+        let note_missed = |last: &mut Last| {
+            last.still = 0;
+            if guard_saw_none && !last.unguarded {
+                last.unguarded = true;
+                let now_unguarded = UNGUARDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                tracing::info!(address = format_args!("{start:#x}"), size, now_unguarded, "texture written past the guard: hashed at every check");
+            }
+        };
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
@@ -774,11 +848,19 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
+                if same_sample(last, tiled) {
+                    note_same(last);
+                    return size;
+                }
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    note_same(last);
                     return size;
+                }
+                if last.hash.is_some() {
+                    note_missed(last);
                 }
                 last.hash = Some(hash);
                 self.detile(tiled);
@@ -790,11 +872,19 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        if same_sample(last, tiled) {
+            note_same(last);
+            return size;
+        }
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            note_same(last);
             return size;
+        }
+        if last.hash.is_some() {
+            note_missed(last);
         }
         last.hash = Some(hash);
         self.detile(tiled);
@@ -1275,5 +1365,21 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sample_tests {
+    use super::sample;
+
+    #[test]
+    fn a_sample_sees_a_new_frame_and_not_an_unchanged_one() {
+        let frame: Vec<u8> = (0..8_294_400u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        assert_eq!(sample(&frame), sample(&frame.clone()));
+        let next: Vec<u8> = frame.iter().map(|b| b.wrapping_add(1)).collect();
+        assert_ne!(sample(&frame), sample(&next));
+        // Tiny and empty buffers do not panic.
+        let _ = sample(&[1, 2, 3]);
+        let _ = sample(&[]);
     }
 }

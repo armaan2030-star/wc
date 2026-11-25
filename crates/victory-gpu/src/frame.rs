@@ -28,6 +28,10 @@ const SIXTIETH: Duration = Duration::from_micros(16_667);
 struct Clock {
     start: Instant,
     interval: Duration,
+    /// The interval the title asked for, restored when a forced one ends.
+    title: Duration,
+    /// When a forced interval ends (`VICTORY_FRAME_60_SECONDS`).
+    forced_until: Option<Instant>,
     /// The tick number at `start` (ticks go on across interval changes).
     first: u64,
 }
@@ -49,11 +53,27 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    // `VICTORY_FRAME_INTERVAL_US` overrides what the title asks for, so a
+    // 30 fps front end can be paced at 60 fps without rebuilding the title.
+    // `VICTORY_FRAME_60_SECONDS` (60) ends the override so the title's own
+    // cadence takes over after the loading phase.
+    let title = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let forced = std::env::var("VICTORY_FRAME_INTERVAL_US")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(Duration::from_micros);
+    let seconds = std::env::var("VICTORY_FRAME_60_SECONDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(60);
+    let interval = forced.unwrap_or(title);
+    let forced_until = (interval != title && seconds > 0)
+        .then(|| Instant::now() + Duration::from_secs(seconds));
+    tracing::info!(?title, ?interval, seconds, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -63,6 +83,8 @@ pub(crate) extern "system" fn set_interval(
     *clock() = Some(Clock {
         start: Instant::now(),
         interval,
+        title,
+        forced_until,
         first,
     });
     S_OK
@@ -100,8 +122,20 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
         interval: SIXTIETH,
+        title: SIXTIETH,
+        forced_until: None,
         first: 0,
     });
+    if c.forced_until.is_some_and(|until| Instant::now() >= until) {
+        c.interval = c.title;
+        c.forced_until = None;
+        c.start = Instant::now();
+        c.first = LAST
+            .iter()
+            .map(|t| t.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0);
+    }
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let tick =

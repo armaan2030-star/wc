@@ -38,8 +38,8 @@ pub(crate) fn counts() -> (u64, u64) {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// every host and translation setting that changes the emitted code (the
+/// loop limit, view heap, host wave limit, group sync and clean-up passes).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -52,34 +52,19 @@ fn build() -> &'static [u8; 32] {
             );
         }
         match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                // So is the view heap's null slot (it differs by host GPU):
-                // a translation cached without the clamp must not be served.
+            Ok(bytes) => {
+                // `probe_view_limit` creates the host device when needed, and
+                // `Host::create` records its wave limit before returning, so
+                // both host-derived values are final here.
                 crate::descriptor::host::probe_view_limit();
-                bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
-                }
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
+                fingerprint(
+                    bytes,
+                    limit,
+                    victory_shader::emit::view_heap_limit(),
+                    victory_shader::emit::host_max_wave(),
+                    victory_shader::emit::group_sync(),
+                    victory_shader::emit::shader_opt(),
+                )
             }
             Err(e) => {
                 // Without it no entry can be trusted: a fresh key per run.
@@ -91,6 +76,46 @@ fn build() -> &'static [u8; 32] {
             }
         }
     })
+}
+
+/// The cache key for translating `bytes` with these settings. Every value
+/// here must be one that changes the emitted code.
+fn fingerprint(
+    mut bytes: Vec<u8>,
+    limit: u32,
+    view_limit: u32,
+    host_max_wave: u32,
+    group_sync: u8,
+    shader_opt: u32,
+) -> [u8; 32] {
+    bytes.extend_from_slice(&limit.to_le_bytes());
+    bytes.extend_from_slice(&view_limit.to_le_bytes());
+    // The host's widest wave picks the form of a wave64 compute program
+    // (32-lane halves on WARP or an NVIDIA GPU, 64 lanes on an AMD GPU).
+    // CPU and GPU must not serve each other's translations: a WaveSize(64)
+    // entry cannot even make a pipeline on a 32-lane host.
+    bytes.extend_from_slice(&host_max_wave.to_le_bytes());
+    // Which group barriers wait is part of the translation too.
+    bytes.push(group_sync);
+    // So are the switches that pick the form of a wave64 program: without
+    // them here a run with `VICTORY_WAVE_WIDE=0` was served the translations
+    // an earlier run of the same executable had cached with the switch unset.
+    for name in [
+        "VICTORY_WAVE_WIDE",
+        "VICTORY_WAVE_DEEP_SKIPS",
+        "VICTORY_WAVE_OWN_BITS",
+        "VICTORY_F16_NEAREST",
+    ] {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(b'=');
+        if let Some(value) = std::env::var_os(name) {
+            bytes.extend_from_slice(value.as_encoded_bytes());
+        }
+        bytes.push(0);
+    }
+    // And which clean-up passes ran over the translated code.
+    bytes.extend_from_slice(&shader_opt.to_le_bytes());
+    *blake3::hash(&bytes).as_bytes()
 }
 
 /// The translation of a console shader container, from the cache when
@@ -361,6 +386,44 @@ mod tests {
                 shift: 5,
             }],
         }
+    }
+
+    #[test]
+    fn wave32_and_wave64_hosts_do_not_share_cached_translations() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let container = b"a console container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let key = |host_max_wave| {
+            fingerprint(
+                b"the executable".to_vec(),
+                256,
+                1_000_000,
+                host_max_wave,
+                0,
+                59,
+            )
+        };
+        let (wave32, wave64) = (key(32), key(64));
+
+        assert_eq!(cached(&cache, &wave32, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cached(&cache, &wave64, container, translate),
+            Ok(shader()),
+            "the wave64 host reused the wave32 translation"
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            cached(&cache, &wave32, container, translate),
+            Ok(shader()),
+            "the wave32 host missed its own entry"
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
     }
 
     #[test]
