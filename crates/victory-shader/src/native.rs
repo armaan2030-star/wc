@@ -700,8 +700,9 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
     data.get(start..start.checked_add(usize::try_from(len).ok()?)?)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "synthetic"))]
 pub(crate) mod tests {
+    #![cfg_attr(not(test), allow(dead_code, unused))]
     use super::*;
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];

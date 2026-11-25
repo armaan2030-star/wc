@@ -82,7 +82,7 @@
 
 mod bitcode;
 mod container;
-mod gs;
+pub(crate) mod gs;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -350,6 +350,11 @@ pub struct MergedShaders {
     /// the vertex shader's outputs, its outputs the geometry container's own.
     pub geometry: HostShader,
     pub record_dwords: u32,
+    /// The programs the two were made from, over the merged layout: what a
+    /// host pipeline needs of them besides the host code (the console
+    /// resources they read, whether they store).
+    pub vertex_native: NativeProgram,
+    pub geometry_native: NativeProgram,
 }
 
 /// Translates a geometry program with the ES program it is linked with: the
@@ -412,6 +417,8 @@ pub fn translate_merged_gs(es: &[u8], gs: &[u8]) -> Result<MergedShaders, Shader
         vertex,
         geometry,
         record_dwords: handoff.es.dwords,
+        vertex_native: es_native,
+        geometry_native: native,
     })
 }
 

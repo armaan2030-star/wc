@@ -457,8 +457,9 @@ pub fn handoff(es: &Program, gs: &Program) -> Result<Handoff, ShaderError> {
     Ok(Handoff { es, reads, vertices })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "synthetic"))]
 pub(crate) mod tests {
+    #![cfg_attr(not(test), allow(dead_code, unused))]
     use super::*;
 
     pub const S_ENDPGM: u32 = 0xBF81_0000;

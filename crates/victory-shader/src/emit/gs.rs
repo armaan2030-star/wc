@@ -233,8 +233,9 @@ pub(crate) fn plan(gs: &Program, handoff: &Handoff, outputs: &[SigElement]) -> R
     Ok(p)
 }
 
-#[cfg(test)]
-pub(super) mod tests {
+#[cfg(any(test, feature = "synthetic"))]
+pub(crate) mod tests {
+    #![cfg_attr(not(test), allow(dead_code, unused))]
     use super::*;
     use crate::dxbc::FourCC;
     use crate::handoff::tests::*;
@@ -401,5 +402,22 @@ pub(super) mod tests {
             v.validate(&mut out.vertex.dxil.clone()).unwrap();
             v.validate(&mut out.geometry.dxil.clone()).unwrap();
         }
+    }
+
+    /// The host makes a pipeline of the pair: vertex shader, geometry shader
+    /// and a pixel stage, as the pipeline path of the host does.
+    #[test]
+    #[cfg(windows)]
+    fn the_host_makes_a_pipeline_of_the_pair() {
+        use super::super::host::{Host, stub_ps};
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let out = super::super::translate_merged_gs(&es_container(), &gs_container(3)).unwrap();
+        let ps = stub_ps();
+        let root = host.root_signature(&out.vertex, &ps).unwrap();
+        host.pipeline_with_gs(&root, &out.vertex.dxil, Some(&out.geometry.dxil), &ps.dxil)
+            .unwrap();
     }
 }
