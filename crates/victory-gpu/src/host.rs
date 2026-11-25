@@ -4326,7 +4326,11 @@ impl Host {
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
             }
-            text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
+            if progress.is_empty() {
+                text.push_str("; no DRED breadcrumb nodes (GPU progress unknown)");
+            } else {
+                text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
+            }
             let mut plain = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = plain.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
@@ -6381,9 +6385,9 @@ impl Host {
     }
 }
 
-/// For adapters without device-removed data (the software one): the last
-/// commands each list of the failed submission noted (diagnostics, with
-/// `VICTORY_D3D12_DRED`).
+/// The last recorded commands in each list of the failed submission
+/// (diagnostics, with `VICTORY_D3D12_DRED`). These notes describe recording;
+/// GPU progress comes from the breadcrumbs.
 fn last_notes(runs: &[&HostList]) -> String {
     #[cfg(feature = "diagnostics")]
     {
@@ -6391,7 +6395,11 @@ fn last_notes(runs: &[&HostList]) -> String {
         for (i, r) in runs.iter().enumerate() {
             let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
             for (n, _) in notes.iter().rev().take(6).rev() {
-                text.push_str(&format!("; list {i} of {}, of its {}: {n}", runs.len(), notes.len()));
+                text.push_str(&format!(
+                    "; list {i} of {}, recorded command ({} in list): {n}",
+                    runs.len(),
+                    notes.len()
+                ));
             }
         }
         text
