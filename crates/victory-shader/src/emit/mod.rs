@@ -381,6 +381,8 @@ pub fn translate_merged_gs(es: &[u8], gs: &[u8]) -> Result<MergedShaders, Shader
             gs: None,
         },
     )?;
+    let mut vertex = vertex;
+    vertex.stage = HwStage::Vs;
     // The GS half.
     let gc = Container::parse(gs)?;
     let native = merged.program();
@@ -389,6 +391,21 @@ pub fn translate_merged_gs(es: &[u8], gs: &[u8]) -> Result<MergedShaders, Shader
     let res = resource::track_merged(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
+    // What the runtime table gives is taken to be the base of the output
+    // records, which the plan does not use: a second field read from it is
+    // not that, and would be read as zero.
+    let fields: std::collections::BTreeSet<u32> = res
+        .scalar
+        .iter()
+        .filter(|(_, a)| a.param == resource::RUNTIME_TABLE)
+        .map(|(_, a)| a.offset)
+        .collect();
+    if fields.len() > 1 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "more than one field read from the runtime table",
+        });
+    }
     let outs = match gc.part(FourCC::OSG1) {
         Some(part) => signature(part.data)?,
         None => Vec::new(),

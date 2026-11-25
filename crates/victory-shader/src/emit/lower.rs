@@ -4297,6 +4297,8 @@ impl<'a> Lower<'a> {
                     };
                     let args = [self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(k), value];
                     self.s.op(self.cur, name, Attr::NoUnwind, void, 5, &args);
+                    // (the signature says which components are written)
+                    self.s.outputs[id].usage |= 1 << (e.col + k);
                 }
             }
             self.s.op(self.cur, "emitStream", Attr::NoUnwind, void, 97, &[stream]);
