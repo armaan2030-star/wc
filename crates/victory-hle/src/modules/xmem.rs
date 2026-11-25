@@ -360,6 +360,11 @@ struct Section {
     /// temporary view, so a run with the switch on can tell which sections
     /// are really persistent.
     fallback_noted: OnceLock<()>,
+    /// Bytes `[from, from + len)` of this section, from its start, that live
+    /// persistent views hold. The section has one address, so two writers may
+    /// share it only when their bytes do not touch; a claim that does is
+    /// refused and the caller takes a temporary view instead.
+    holding: Mutex<Vec<(usize, usize)>>,
 }
 
 // SAFETY: a section handle may be used from any thread.
@@ -375,6 +380,31 @@ impl Section {
             size,
             committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
             fallback_noted: OnceLock::new(),
+            holding: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Claims bytes `[from, from + len)` of the section for one persistent
+    /// view. False when a live one already holds bytes that touch: the
+    /// section's mapping is a single address, so sharing it is sharing a
+    /// borrow, and only writers whose bytes are disjoint may do that.
+    fn hold(&self, from: usize, len: usize) -> bool {
+        let mut holding = self.holding.lock().unwrap_or_else(|e| e.into_inner());
+        if holding
+            .iter()
+            .any(|&(at, bytes)| from < at + bytes && at < from + len)
+        {
+            return false;
+        }
+        holding.push((from, len));
+        true
+    }
+
+    /// Gives back what [`Section::hold`] claimed.
+    fn let_go(&self, from: usize, len: usize) {
+        let mut holding = self.holding.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = holding.iter().position(|&held| held == (from, len)) {
+            holding.swap_remove(held);
         }
     }
 
@@ -690,9 +720,12 @@ enum View {
     /// The section's persistent view, at `slice`'s pages. Nothing is unmapped
     /// when this drops: the view belongs to the section and goes with it.
     Persistent {
-        /// Keeps the section, and so the view, alive while the bytes are used.
-        _section: Arc<Section>,
+        /// Keeps the section, and so the view, alive while the bytes are
+        /// used, and gives the held bytes back when this drops.
+        section: Arc<Section>,
         ptr: *mut u8,
+        /// Bytes `[from, from + len)` of the section this view holds.
+        from: usize,
         len: usize,
     },
 }
@@ -725,13 +758,23 @@ impl View {
     fn persistent(slice: &Slice, n: usize) -> Option<View> {
         let base = slice.section.persistent_ptr()?;
         let len = n.checked_mul(PAGE)?;
+        let from = slice.index * PAGE;
+        // The section's one mapping is one address, so two writers may share
+        // it only when their bytes do not touch. A claim that touches a live
+        // one is refused, and the caller takes a temporary view: that has an
+        // address of its own, so writers whose bytes really do overlap go
+        // through two addresses and never through two slices at one.
+        if !slice.section.hold(from, len) {
+            return None;
+        }
         if !slice.section.ensure_committed(base, slice.index, n) {
+            slice.section.let_go(from, len);
             slice.section.note_fallback();
             return None;
         }
         // SAFETY: `ensure_committed` proved `[slice.index, slice.index + n)`
         // lies inside the section, so this is inside the section's view.
-        let ptr = unsafe { base.add(slice.index * PAGE) };
+        let ptr = unsafe { base.add(from) };
         // Said once: whether the switch is really in effect is otherwise
         // invisible in a run, and the switch becoming the default rests on a
         // run that showed it working.
@@ -742,39 +785,55 @@ impl View {
             );
         }
         Some(View::Persistent {
-            _section: slice.section.clone(),
+            section: slice.section.clone(),
             ptr,
+            from,
             len,
         })
     }
 
-    fn bytes(&mut self) -> &mut [u8] {
-        let (ptr, len) = match self {
+    /// Bytes `[from, from + len)` of this view, and nothing besides.
+    ///
+    /// The slice covers exactly what the caller writes. That is what lets two
+    /// writers through the section's one persistent mapping coexist: their
+    /// byte ranges do not overlap, so their slices are disjoint even when
+    /// they lie in the same page, which a slice over the whole run would not
+    /// give. Writes that really did overlap would still need an exclusion
+    /// rule of their own; this only stops ranges that never touch from
+    /// being made to share a borrow.
+    fn bytes_at(&mut self, from: usize, len: usize) -> &mut [u8] {
+        let (ptr, whole) = match self {
             View::Temporary { at, len } => (at.Value.cast::<u8>(), *len),
             View::Persistent { ptr, len, .. } => (*ptr, *len),
         };
-        // SAFETY: the view holds `len` committed read-write bytes. For a
+        assert!(
+            from.checked_add(len).is_some_and(|end| end <= whole),
+            "view bytes {from}+{len} past a view of {whole}"
+        );
+        // SAFETY: the view holds `whole` committed read-write bytes, and
+        // `[from, from + len)` lies inside them (`whole` is `n * PAGE`, a
+        // multiple of the page, so the pointer stays in the view). For a
         // temporary view those bytes have an address of their own, so no
         // other borrow of them exists. For the persistent variant the
-        // section's one mapping is shared, and keeping two live `&mut [u8]`
-        // at one base apart is this module's job: callers hand out one run
-        // per write in flight, and two writes in flight in one section never
-        // cover the same page, because the title writes each destination
-        // alone (`dstorage`). That disjointness is a precondition of this
-        // variant, not a convention: overlapping runs would be undefined
-        // behaviour here, where two separate virtual views made them merely
-        // a race.
-        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+        // section's one mapping is shared, and two live `&mut` at one base
+        // are kept apart twice over: each covers only its own writer's
+        // bytes, and `Section::hold` refused the view outright if those
+        // bytes touched another live one.
+        unsafe { std::slice::from_raw_parts_mut(ptr.add(from), len) }
     }
 }
 
 impl Drop for View {
     fn drop(&mut self) {
-        // Only a temporary view is ours to take away.
-        if let View::Temporary { at, .. } = self {
-            use windows_sys::Win32::System::Memory::UnmapViewOfFile;
-            // SAFETY: our view.
-            unsafe { UnmapViewOfFile(*at) };
+        match self {
+            // Only a temporary view is ours to take away.
+            View::Temporary { at, .. } => {
+                use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+                // SAFETY: our view.
+                unsafe { UnmapViewOfFile(*at) };
+            }
+            // The section's mapping stays; the bytes this view held do not.
+            View::Persistent { section, from, len, .. } => section.let_go(*from, *len),
         }
     }
 }
@@ -826,7 +885,7 @@ fn write_physical_with(mapping: Mapping, pages: &[usize], offset: usize, data: &
             return false;
         };
         let k = (n * PAGE - within).min(data.len() - done);
-        view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        view.bytes_at(within, k).copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
     true
@@ -844,7 +903,7 @@ pub(crate) struct PageWindow {
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
-        &mut self.view.bytes()[within..within + len]
+        self.view.bytes_at(within, len)
     }
 }
 
@@ -1549,7 +1608,7 @@ mod tests {
         Mapping::Temporary
             .view(&slice_of(page), 1)
             .expect("mapped")
-            .bytes()
+            .bytes_at(0, PAGE)
             .to_vec()
     }
 
@@ -1738,6 +1797,75 @@ mod tests {
         assert_eq!(&second[..3], &[0xa5, 0xa5, 0xa5]);
         assert!(second[3..].iter().all(|&b| b == 0));
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// A view's slice covers the bytes asked for and no more, on either path.
+    /// That extent is what lets two writers through the section's one mapping
+    /// hold slices at once: their ranges do not overlap, so their slices are
+    /// disjoint even inside a single page, where a slice over the whole run
+    /// would have made ranges that never touch share one borrow.
+    ///
+    /// Mutation run 2026-11-25, restored: returning the whole view from
+    /// `bytes_at` fails the "exactly" assertions, and removing its end check
+    /// makes the past-the-end row read on instead of refusing.
+    #[test]
+    fn a_view_slice_covers_only_the_bytes_asked_for() {
+        let pages = allocate(2);
+        let slice = slice_of(pages[0]);
+        for (name, mapping) in [
+            ("temporary", Mapping::Temporary),
+            ("persistent", Mapping::Persistent),
+        ] {
+            let mut view = mapping.view(&slice, 1).expect("one page mapped");
+            // Exactly three bytes, not the rest of the page.
+            assert_eq!(view.bytes_at(5, 3).len(), 3, "{name}: not the whole run");
+            view.bytes_at(5, 3).copy_from_slice(&[1, 2, 3]);
+            let page = page_bytes(pages[0]);
+            assert_eq!(&page[5..8], &[1, 2, 3], "{name}");
+            assert_eq!((page[4], page[8]), (0, 0), "{name}: only those bytes");
+            // Past the end it refuses rather than reading on.
+            let past = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                view.bytes_at(PAGE - 1, 2).len()
+            }));
+            assert!(past.is_err(), "{name}: read past the end of the view");
+        }
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// The section's mapping is one address, so two writers may share it only
+    /// when their bytes do not touch. A claim that touches a live one is
+    /// refused and the caller takes a temporary view, which has an address of
+    /// its own -- the exclusion the previous commit only assumed.
+    ///
+    /// Mutation run 2026-11-25: with the claim skipped, the second view below
+    /// is `Persistent` and two writers hold slices at one base.
+    #[test]
+    fn a_second_overlapping_persistent_view_falls_back_to_a_temporary_one() {
+        let pages = allocate(3);
+        let first = View::persistent(&slice_of(pages[0]), 1).expect("one page");
+        assert!(
+            matches!(first, View::Persistent { .. }),
+            "the first claim is kept"
+        );
+        // The same bytes again: refused as a persistent view...
+        assert!(View::persistent(&slice_of(pages[0]), 1).is_none());
+        // ...and the caller lands on a view of its own address.
+        let second = Mapping::Persistent
+            .view(&slice_of(pages[0]), 1)
+            .expect("a temporary view");
+        assert!(
+            matches!(second, View::Temporary { .. }),
+            "overlapping bytes shared one address"
+        );
+        // A neighbour's bytes do not touch, so they may share the mapping.
+        let neighbour = View::persistent(&slice_of(pages[1]), 1).expect("next page");
+        assert!(matches!(neighbour, View::Persistent { .. }));
+        // Once the first is gone its bytes may be held again.
+        drop(first);
+        let again = View::persistent(&slice_of(pages[0]), 1).expect("free again");
+        assert!(matches!(again, View::Persistent { .. }));
+        drop((second, neighbour, again));
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     /// The temporary path is what every run before this one used, and it
