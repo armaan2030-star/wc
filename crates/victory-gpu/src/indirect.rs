@@ -49,6 +49,8 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+// Threads launched when capped at D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION (65535).
+static const uint GRID_STRIDE = 65535u * 64u;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -57,77 +59,79 @@ void main(uint3 id : SV_DispatchThreadID) {
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
-    uint cost;
-    uint2 draw_counts = uint2(0, 0);
-    uint3 groups = uint3(0, 0, 0);
-    if (kind <= 1) {
-        // Draws: vertex or index count, then instances.
-        uint2 asked = src_args.Load2(src_at);
-        if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
-            asked = uint2(0, 0);
+    [allow_uav_condition]
+    for (uint idx = id.x; idx < eff_count; idx += GRID_STRIDE) {
+        uint src_at = args_offset + idx * stride;
+        uint dst_at = idx * stride;
+        uint cost;
+        uint2 draw_counts = uint2(0, 0);
+        uint3 groups = uint3(0, 0, 0);
+        if (kind <= 1) {
+            // Draws: vertex or index count, then instances.
+            uint2 asked = src_args.Load2(src_at);
+            if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
+                asked = uint2(0, 0);
+            }
+            uint count = min(asked.x, 1u << 24);
+            uint instances = min(asked.y, (1u << 26) / max(count, 1u));
+            cost = count * instances;
+            draw_counts = uint2(count, instances);
+        } else if (kind == 2) {
+            uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+            // x * y fits 32 bits; the whole count may not.
+            if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+                g = uint3(0, 0, 0);
+            }
+            cost = g.x * g.y * g.z * 64u;
+            groups = g;
+        } else {
+            // Mesh dispatches: the console's are one-dimensional.
+            uint3 g = src_args.Load3(src_at);
+            // Ahead of its draw, a record over the most a dispatch runs is a
+            // slot the title has not filled (the title leaves all
+            // ones there): empty, and not counted below either.
+            if (ahead && g.x > 65535u) {
+                g = uint3(0, 0, 0);
+            }
+            // Diagnostics, in the budget buffer's next words: the largest
+            // group count a mesh record asked for, and the groups asked in all.
+            uint was;
+            budget.InterlockedMax(4, g.x, was);
+            budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+            g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+            cost = g.x * g.y * g.z * 128u;
+            groups = g;
         }
-        uint count = min(asked.x, 1u << 24);
-        uint instances = min(asked.y, (1u << 26) / max(count, 1u));
-        cost = count * instances;
-        draw_counts = uint2(count, instances);
-    } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
+        bool over = false;
+        if (cost > 0) {
+            uint before;
+            budget.InterlockedOr(0, 0, before);
+            [allow_uav_condition]
+            while (before < BUDGET) {
+                uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
+                uint prev;
+                budget.InterlockedCompareExchange(0, before, next, prev);
+                if (prev == before) break;
+                before = prev;
+            }
+            over = before >= BUDGET || BUDGET - before < cost;
         }
-        cost = g.x * g.y * g.z * 64u;
-        groups = g;
-    } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = src_args.Load3(src_at);
-        // Ahead of its draw, a record over the most a dispatch runs is a
-        // slot the title has not filled (the title leaves all
-        // ones there): empty, and not counted below either.
-        if (ahead && g.x > 65535u) {
-            g = uint3(0, 0, 0);
-        }
-        // Diagnostics, in the budget buffer's next words: the largest
-        // group count a mesh record asked for, and the groups asked in all.
-        uint was;
-        budget.InterlockedMax(4, g.x, was);
-        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128u;
-        groups = g;
-    }
-    bool over = false;
-    if (cost > 0) {
-        uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
-        }
-        over = before >= BUDGET || BUDGET - before < cost;
-    }
-    if (kind <= 1) {
-        if (over) {
-            draw_counts = uint2(0, 0);
-        }
-        dst_args.Store2(dst_at, draw_counts);
-        for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
-        }
-    } else {
-        if (over) {
-            groups = uint3(0, 0, 0);
-        }
-        dst_args.Store3(dst_at, groups);
-        for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        if (kind <= 1) {
+            if (over) {
+                draw_counts = uint2(0, 0);
+            }
+            dst_args.Store2(dst_at, draw_counts);
+            for (uint off = 8; off < stride; off += 4) {
+                dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            }
+        } else {
+            if (over) {
+                groups = uint3(0, 0, 0);
+            }
+            dst_args.Store3(dst_at, groups);
+            for (uint off = 12; off < stride; off += 4) {
+                dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            }
         }
     }
 }
@@ -209,6 +213,17 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
         })?;
         Ok(Clamp { root, pso })
     }
+}
+
+/// D3D12 limit: `D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION`.
+const MAX_GROUPS_X: u32 = 65_535;
+const THREADS_PER_GROUP: u32 = 64;
+
+/// Number of X thread groups to dispatch for `records`. Counts beyond
+/// `MAX_GROUPS_X * THREADS_PER_GROUP` are covered by the compute shader's
+/// grid-stride loop so `Dispatch` never exceeds D3D12's 65,535-group limit.
+fn dispatch_groups_x(records: u32) -> u32 {
+    records.div_ceil(THREADS_PER_GROUP).min(MAX_GROUPS_X)
 }
 
 /// Minimum record byte stride for a supported PC indirect argument `kind`.
@@ -384,7 +399,7 @@ fn record_clamp_as(
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            l.Dispatch(dispatch_groups_x(records), 1, 1);
         }
         l.ResourceBarrier(&second[skip..]);
     }
@@ -1212,6 +1227,89 @@ void main() {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    #[test]
+    fn dispatch_groups_x_never_exceeds_d3d12_limit() {
+        assert_eq!(dispatch_groups_x(0), 0);
+        assert_eq!(dispatch_groups_x(1), 1);
+        assert_eq!(dispatch_groups_x(64), 1);
+        assert_eq!(dispatch_groups_x(65), 2);
+        assert_eq!(dispatch_groups_x(MAX_GROUPS_X * THREADS_PER_GROUP), MAX_GROUPS_X);
+        assert_eq!(
+            dispatch_groups_x(MAX_GROUPS_X * THREADS_PER_GROUP + 1),
+            MAX_GROUPS_X
+        );
+        assert_eq!(dispatch_groups_x(u32::MAX / 12), MAX_GROUPS_X);
+        assert_eq!(dispatch_groups_x(u32::MAX), MAX_GROUPS_X);
+    }
+
+    #[test]
+    fn grid_stride_clamps_records_beyond_65535_groups_on_warp() {
+        let Some(mut h) = WarpHarness::new() else {
+            return;
+        };
+        const STRIDE: u32 = 12;
+        const GRID_THREADS: u32 = MAX_GROUPS_X * THREADS_PER_GROUP;
+        const TAIL_IDX: u32 = GRID_THREADS + 1;
+        const RECORDS: u32 = GRID_THREADS + 2;
+        let total_bytes = (RECORDS as usize) * (STRIDE as usize);
+
+        let (src_buf, src_ptr, _) = h.shared_buffer(total_bytes as u64);
+        let (count_buf, count_ptr, _) = h.shared_buffer(16);
+        let (budget_buf, budget_ptr, budget_gpu) = h.shared_buffer(16);
+        let (dst_buf, dst_ptr, _) = h.shared_buffer(total_bytes as u64);
+
+        // SAFETY: mapped host buffers of exact `total_bytes` / 16 bytes.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0, total_bytes);
+            std::ptr::write_bytes(dst_ptr, 0xCC, total_bytes);
+            std::ptr::write_bytes(budget_ptr, 0, 16);
+            (count_ptr as *mut u32).write_volatile(RECORDS);
+
+            let src_u32 = src_ptr.cast::<u32>();
+            // Record 0 (first stride): oversized X group count -> clamped to 65535.
+            src_u32.add(0).write_volatile(70_000);
+            src_u32.add(1).write_volatile(1);
+            src_u32.add(2).write_volatile(1);
+            // Record past 65535 * 64 (second grid-stride iteration): clamped to 65535.
+            let tail = (TAIL_IDX as usize) * 3;
+            src_u32.add(tail).write_volatile(80_000);
+            src_u32.add(tail + 1).write_volatile(1);
+            src_u32.add(tail + 2).write_volatile(1);
+        }
+
+        assert!(record_clamp(
+            &h.clamp,
+            &h.list,
+            &dst_buf,
+            budget_gpu,
+            (&src_buf, 0),
+            Some((&count_buf, 0)),
+            (2, STRIDE, RECORDS),
+        ));
+        done_on(&h.list, &dst_buf);
+        h.submit_and_wait();
+
+        // SAFETY: GPU finished; querying device health and reading back clamped records.
+        unsafe {
+            assert!(h.device.GetDeviceRemovedReason().is_ok());
+            let dst_u32 = dst_ptr.cast::<u32>();
+            let first = [
+                dst_u32.add(0).read_volatile(),
+                dst_u32.add(1).read_volatile(),
+                dst_u32.add(2).read_volatile(),
+            ];
+            let tail = (TAIL_IDX as usize) * 3;
+            let last = [
+                dst_u32.add(tail).read_volatile(),
+                dst_u32.add(tail + 1).read_volatile(),
+                dst_u32.add(tail + 2).read_volatile(),
+            ];
+            assert_eq!(first, [65_535, 1, 1]);
+            assert_eq!(last, [65_535, 1, 1]);
+            let _ = &budget_buf;
+        }
     }
 }
 
