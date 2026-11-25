@@ -721,23 +721,28 @@ impl Staging {
             }
         }
         // From here on the texture's memory may be read in place. Held until
-        // that read is done: the runtime changes what title memory shows
-        // only with this taken alone, so what `committed` finds mapped
-        // stays mapped (see `crate::watch::title_memory_reading`; without
-        // it a page went between the asking and the read in runs 71 and
-        // 74).
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
+        // that read is done: the runtime changes what title memory shows for
+        // `[start, start + size)` only with an overlapping remapping lock
+        // (`crate::watch::title_memory_reading_range`), so what `committed`
+        // finds mapped stays mapped while disjoint remappings run freely
+        // (without a lock a page went between the asking and the read in runs
+        // 71 and 74).
+        let mapped = if no_wait() {
+            // Not waited for: while the runtime remaps an overlapping range the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_range_now(start, size) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_range(start, size))
         };
         if !committed(self.memory, size) {
+            // The partial path reads through the kernel (`copy_mapped`), which
+            // needs no mapping lock; release it before copying, hashing and
+            // detiling.
+            drop(mapped);
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
@@ -773,6 +778,7 @@ impl Staging {
             return size;
         }
         if through_copy() {
+            drop(mapped);
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -788,16 +794,18 @@ impl Staging {
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            drop(mapped);
             return size;
         }
         last.hash = Some(hash);
         self.detile(tiled);
+        drop(mapped);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size

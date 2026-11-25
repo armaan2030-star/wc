@@ -586,8 +586,8 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
-/// Held shared by a read of title memory in place, and alone by the runtime
-/// while it changes what title memory shows.
+/// Active in-place reads and remappings of title memory, by virtual address
+/// half-open interval `[start, end)`.
 ///
 /// The runtime does not change a mapping in one step. To unmap one page of
 /// a view it unmaps the whole view and maps what stays again
@@ -599,40 +599,229 @@ pub fn writing(at: usize, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+///
+/// Tracking ranges instead of one address-space-wide `RwLock<()>` lets the
+/// runtime remap pages in one region while texture refreshes read unrelated
+/// textures in another, eliminating the reader/writer convoy that stalled
+/// refreshes for 75-500 ms per frame while streaming (issue #431).
+struct MappingRanges {
+    next_id: u64,
+    readers: Vec<(u64, usize, usize)>,
+    writers: Vec<(u64, usize, usize)>,
+    /// Writers waiting for overlapping active readers or writers, ordered by
+    /// `id`. Blocks newly arriving overlapping readers (preventing writer
+    /// starvation) without blocking disjoint readers, and enforces an acyclic
+    /// FIFO order among overlapping writers.
+    waiting_writers: Vec<(u64, usize, usize)>,
+    waiters: usize,
+}
+
+impl MappingRanges {
+    const fn new() -> Self {
+        Self {
+            next_id: 1,
+            readers: Vec::new(),
+            writers: Vec::new(),
+            waiting_writers: Vec::new(),
+            waiters: 0,
+        }
+    }
+
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn writer_blocks(&self, start: usize, end: usize) -> bool {
+        self.writers
+            .iter()
+            .any(|&(_, s, e)| ranges_overlap(start, end, s, e))
+            || self
+                .waiting_writers
+                .iter()
+                .any(|&(_, s, e)| ranges_overlap(start, end, s, e))
+    }
+
+    fn write_blocked(&self, id: u64, start: usize, end: usize) -> bool {
+        self.readers
+            .iter()
+            .any(|&(_, s, e)| ranges_overlap(start, end, s, e))
+            || self
+                .writers
+                .iter()
+                .any(|&(_, s, e)| ranges_overlap(start, end, s, e))
+            || self
+                .waiting_writers
+                .iter()
+                .any(|&(wid, s, e)| wid < id && ranges_overlap(start, end, s, e))
+    }
+}
+
+fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+/// Range-based reader/writer lock over virtual address intervals.
+///
+/// Invariant: no active reader and active writer (nor two active writers) ever
+/// hold overlapping `[start, end)` intervals simultaneously.
+struct RangeLock {
+    state: Mutex<MappingRanges>,
+    wake: std::sync::Condvar,
+}
+
+impl RangeLock {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(MappingRanges::new()),
+            wake: std::sync::Condvar::new(),
+        }
+    }
+
+    fn read(&self, start: usize, len: usize) -> Option<u64> {
+        let end = start.saturating_add(len);
+        if start == end {
+            return None;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while state.writer_blocks(start, end) {
+            state.waiters += 1;
+            state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+            state.waiters -= 1;
+        }
+        let id = state.alloc_id();
+        state.readers.push((id, start, end));
+        Some(id)
+    }
+
+    fn try_read(&self, start: usize, len: usize) -> Option<Option<u64>> {
+        let end = start.saturating_add(len);
+        if start == end {
+            return Some(None);
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.writer_blocks(start, end) {
+            return None;
+        }
+        let id = state.alloc_id();
+        state.readers.push((id, start, end));
+        Some(Some(id))
+    }
+
+    fn unlock_read(&self, id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = state.readers.iter().position(|r| r.0 == id) {
+            state.readers.swap_remove(pos);
+        }
+        let notify = state.waiters > 0 && !state.waiting_writers.is_empty();
+        drop(state);
+        if notify {
+            self.wake.notify_all();
+        }
+    }
+
+    fn write(&self, start: usize, len: usize) -> Option<u64> {
+        let end = start.saturating_add(len);
+        if start == end {
+            return None;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let id = state.alloc_id();
+        state.waiting_writers.push((id, start, end));
+        while state.write_blocked(id, start, end) {
+            state.waiters += 1;
+            state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+            state.waiters -= 1;
+        }
+        if let Some(pos) = state.waiting_writers.iter().position(|w| w.0 == id) {
+            state.waiting_writers.swap_remove(pos);
+        }
+        state.writers.push((id, start, end));
+        Some(id)
+    }
+
+    fn unlock_write(&self, id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = state.writers.iter().position(|w| w.0 == id) {
+            state.writers.swap_remove(pos);
+        }
+        let notify = state.waiters > 0;
+        drop(state);
+        if notify {
+            self.wake.notify_all();
+        }
+    }
+}
+
+static MAPPING: RangeLock = RangeLock::new();
 
 /// What the runtime holds while it changes what title memory shows
-/// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+/// ([`title_memory_remapping`], [`title_memory_remapping_range`]).
+#[must_use]
+pub struct Remapping(Option<u64>);
 
-/// The runtime is about to map, unmap or move physical pages of title
-/// memory: until what it returns is dropped, no read of title memory in
-/// place is under way and none begins ([`title_memory_reading`]). Taken
-/// around the whole change, the unmapping and the mapping again.
-pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
-}
-
-/// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
-
-/// For reading title memory in place: until what it returns is dropped,
-/// the runtime changes no mapping, so memory found mapped stays mapped.
-/// Not to be taken twice by one thread, nor held across anything that
-/// maps title memory.
-pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
-}
-
-/// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
-pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.take() {
+            MAPPING.unlock_write(id);
+        }
     }
+}
+
+/// The runtime is about to map, unmap or move physical pages anywhere in title
+/// memory: until what it returns is dropped, no read of title memory in place
+/// is under way and none begins ([`title_memory_reading`]). Prefer
+/// [`title_memory_remapping_range`] when the affected virtual address hull is
+/// known.
+pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_range(0, usize::MAX)
+}
+
+/// The runtime is about to map, unmap or move physical pages covering
+/// `[start, start + len)` (which must include every full existing view that
+/// `UnmapViewOfFile2` will transiently unmap): until what it returns is
+/// dropped, no overlapping in-place read is under way and none begins.
+/// Disjoint reads proceed concurrently.
+pub fn title_memory_remapping_range(start: usize, len: usize) -> Remapping {
+    Remapping(MAPPING.write(start, len))
+}
+
+/// What a read of title memory in place holds ([`title_memory_reading`],
+/// [`title_memory_reading_range`]).
+#[must_use]
+pub struct Reading(Option<u64>);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.take() {
+            MAPPING.unlock_read(id);
+        }
+    }
+}
+
+/// For reading title memory in place across the whole address space: until what
+/// it returns is dropped, the runtime changes no mapping. Not to be taken twice
+/// by one thread, nor held across anything that maps title memory. Prefer
+/// [`title_memory_reading_range`] when the read range is known.
+pub fn title_memory_reading() -> Reading {
+    title_memory_reading_range(0, usize::MAX)
+}
+
+/// For reading `[start, start + len)` of title memory in place: until what it
+/// returns is dropped, the runtime changes no mapping overlapping that range,
+/// so memory found mapped stays mapped while disjoint remappings run freely.
+/// Not to be taken twice by one thread, nor held across anything that maps
+/// title memory.
+pub fn title_memory_reading_range(start: usize, len: usize) -> Reading {
+    Reading(MAPPING.read(start, len))
+}
+
+/// [`title_memory_reading_range`] if it can be had at once: `None` while the
+/// runtime changes a mapping overlapping `[start, start + len)` (or waits to),
+/// for a caller that has another way to read and would rather not wait.
+pub(crate) fn title_memory_reading_range_now(start: usize, len: usize) -> Option<Reading> {
+    MAPPING.try_read(start, len).map(Reading)
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1059,9 +1248,9 @@ mod tests {
 
 #[cfg(test)]
 mod mapping_tests {
-    use super::{title_memory_reading, title_memory_remapping};
+    use super::{RangeLock, title_memory_reading, title_memory_remapping};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
     /// A change of mapping waits for a read in place that is under way, and
@@ -1104,5 +1293,108 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn disjoint_ranges_do_not_block_each_other() {
+        let lock = RangeLock::new();
+        let w1 = lock.write(0x1000, 0x1000).expect("writer acquired");
+        // Adjacent non-overlapping ranges and empty ranges succeed immediately.
+        let r_left = lock
+            .try_read(0x0000, 0x1000)
+            .expect("left adjacent reader")
+            .expect("non-empty read");
+        let r_right = lock
+            .try_read(0x2000, 0x1000)
+            .expect("right adjacent reader")
+            .expect("non-empty read");
+        assert_eq!(lock.try_read(0x1500, 0), Some(None));
+        // Overlapping reads and whole-space reads are blocked.
+        assert!(lock.try_read(0x1800, 0x1000).is_none());
+        assert!(lock.try_read(0x0800, 0x1000).is_none());
+        assert!(lock.try_read(0, usize::MAX).is_none());
+        // Disjoint writer proceeds concurrently.
+        let w2 = lock.write(0x3000, 0x1000).expect("disjoint writer");
+        lock.unlock_write(w2);
+        lock.unlock_read(r_left);
+        lock.unlock_read(r_right);
+        lock.unlock_write(w1);
+        // After writer drops, overlapping read succeeds.
+        let r_after = lock
+            .try_read(0x1800, 0x1000)
+            .expect("read after writer drop")
+            .expect("non-empty read");
+        lock.unlock_read(r_after);
+        let state = lock.state.lock().unwrap();
+        assert!(state.readers.is_empty());
+        assert!(state.writers.is_empty());
+        assert!(state.waiting_writers.is_empty());
+        assert_eq!(state.waiters, 0);
+    }
+
+    #[test]
+    fn waiting_writer_blocks_overlapping_readers_without_blocking_disjoint() {
+        let lock = Arc::new(RangeLock::new());
+        let r1 = lock.read(0x1000, 0x2000).expect("reader acquired");
+        let acquired = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let lock = lock.clone();
+            let acquired = acquired.clone();
+            std::thread::spawn(move || {
+                let w = lock.write(0x2000, 0x2000).expect("writer acquired");
+                acquired.store(true, Ordering::SeqCst);
+                lock.unlock_write(w);
+            })
+        };
+        while lock.state.lock().unwrap().waiting_writers.is_empty() {
+            std::thread::yield_now();
+        }
+        assert!(!acquired.load(Ordering::SeqCst));
+        // Overlapping new reader must wait behind the queued writer.
+        assert!(lock.try_read(0x2800, 0x1000).is_none());
+        // Disjoint new reader proceeds immediately despite the queued writer.
+        let r_disjoint = lock
+            .try_read(0x4000, 0x1000)
+            .expect("disjoint reader must not block")
+            .expect("non-empty read");
+        lock.unlock_read(r_disjoint);
+        lock.unlock_read(r1);
+        writer.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn overlapping_writers_serialize_in_fifo_order_without_deadlock() {
+        let lock = Arc::new(RangeLock::new());
+        let r1 = lock.read(0x1000, 0x1000).expect("reader acquired");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let w1 = {
+            let lock = lock.clone();
+            let order = order.clone();
+            std::thread::spawn(move || {
+                let w = lock.write(0x1000, 0x2000).expect("w1");
+                order.lock().unwrap().push(1u32);
+                lock.unlock_write(w);
+            })
+        };
+        while lock.state.lock().unwrap().waiting_writers.is_empty() {
+            std::thread::yield_now();
+        }
+        let w2 = {
+            let lock = lock.clone();
+            let order = order.clone();
+            std::thread::spawn(move || {
+                let w = lock.write(0x2000, 0x2000).expect("w2");
+                order.lock().unwrap().push(2u32);
+                lock.unlock_write(w);
+            })
+        };
+        while lock.state.lock().unwrap().waiting_writers.len() < 2 {
+            std::thread::yield_now();
+        }
+        lock.unlock_read(r1);
+        w1.join().unwrap();
+        w2.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), [1, 2]);
     }
 }

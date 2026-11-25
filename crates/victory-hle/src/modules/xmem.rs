@@ -596,6 +596,41 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     })
 }
 
+/// The virtual address hull `[lo, hi)` whose mappings may transiently become
+/// unmapped or uncommitted while remapping `[base, base + len)`.
+///
+/// Windows `UnmapViewOfFile2` unmaps an entire view at once, so [`unmap`]
+/// temporarily removes every existing view overlapping `[base, base + len)`
+/// and re-maps the parts outside it. Locking the full hull guarantees that no
+/// overlapping in-place reader (`victory_gpu::title_memory_reading_range`) can
+/// observe the gap, while disjoint reads proceed without waiting.
+fn affected_range(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
+    if len == 0 {
+        return (base, base);
+    }
+    let end = base.saturating_add(len);
+    let first = physical
+        .views
+        .range(..=base)
+        .next_back()
+        .filter(|entry| entry.0.saturating_add(entry.1.0) > base)
+        .map(|(&at, entry)| (at, at.saturating_add(entry.0)));
+    let last = if base < end.saturating_sub(1) {
+        physical
+            .views
+            .range(base.saturating_add(1)..end)
+            .next_back()
+            .map(|(&at, entry)| (at, at.saturating_add(entry.0)))
+    } else {
+        None
+    };
+    let lo = first.map_or(base, |(at, _)| at.min(base));
+    let hi = end
+        .max(first.map_or(end, |(_, view_end)| view_end))
+        .max(last.map_or(end, |(_, view_end)| view_end));
+    (lo, hi)
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -604,13 +639,22 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    let Some(len) = n.checked_mul(PAGE) else {
+        return std::ptr::null_mut();
+    };
+    if len == 0 {
+        return address;
+    }
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
-    // until it is committed. A read of title memory in place must not fall
-    // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    // until it is committed. Lock the full hull of `[base, base + len)` and
+    // every overlapping existing view (`victory_gpu::title_memory_remapping_range`)
+    // so no overlapping in-place read falls into that gap while disjoint reads
+    // continue without waiting.
+    let (lo, hi) = affected_range(&physical, base, len);
+    let _changing = victory_gpu::title_memory_remapping_range(lo, hi - lo);
+    unmap(&mut physical, base, len);
     if pages.is_null() {
         return address;
     }
@@ -676,9 +720,15 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    if len == 0 {
+        return true;
+    }
     let mut physical = physical();
-    // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    // As in `XMemMapPhysicalPages`: cover the rounded-up pages `map` writes
+    // and every existing view `unmap` will transiently remove.
+    let span = len.div_ceil(PAGE).saturating_mul(PAGE);
+    let (lo, hi) = affected_range(&physical, to, span);
+    let _changing = victory_gpu::title_memory_remapping_range(lo, hi - lo);
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -1326,5 +1376,87 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn affected_range_expands_to_overlapping_views() {
+        let pages = allocate(1);
+        let slice = physical().pages.get(&pages[0]).cloned().expect("slice");
+        let mut state = Physical::default();
+        state.views.insert(100 * PAGE, (4 * PAGE, slice.clone()));
+        state.views.insert(106 * PAGE, (4 * PAGE, slice));
+        // Empty length changes nothing.
+        assert_eq!(affected_range(&state, 101 * PAGE, 0), (101 * PAGE, 101 * PAGE));
+        // Interior page expands to the enclosing view that `unmap` splits.
+        assert_eq!(
+            affected_range(&state, 101 * PAGE, PAGE),
+            (100 * PAGE, 104 * PAGE)
+        );
+        // Start-aligned page expands to the full view.
+        assert_eq!(
+            affected_range(&state, 100 * PAGE, PAGE),
+            (100 * PAGE, 104 * PAGE)
+        );
+        // Span straddling both views expands to the union hull.
+        assert_eq!(
+            affected_range(&state, 103 * PAGE, 4 * PAGE),
+            (100 * PAGE, 110 * PAGE)
+        );
+        // Untouched gap touching both adjacent views does not expand.
+        assert_eq!(
+            affected_range(&state, 104 * PAGE, 2 * PAGE),
+            (104 * PAGE, 106 * PAGE)
+        );
+        // Disjoint range outside all views stays as requested.
+        assert_eq!(
+            affected_range(&state, 200 * PAGE, 2 * PAGE),
+            (200 * PAGE, 202 * PAGE)
+        );
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    /// Splitting a multi-page view by unmapping its middle page transiently
+    /// unmaps the neighbouring pages in that view; `affected_range` covers the
+    /// full view so a range-scoped in-place reader on page 0 never faults.
+    #[test]
+    fn a_range_read_in_place_never_meets_a_split_view_gap() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        // SAFETY: page 0 is mapped read-write.
+        unsafe { a.cast::<u8>().write(0x42) };
+        let first = a as usize;
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let _reading = victory_gpu::title_memory_reading_range(first, PAGE);
+                    // SAFETY: page 0 stays mapped throughout; `affected_range`
+                    // locks the whole 3-page view when page 1 is unmapped.
+                    assert_eq!(unsafe { (first as *const u8).read_volatile() }, 0x42);
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        let middle = a.wrapping_byte_add(PAGE);
+        for _ in 0..1000 {
+            assert_eq!(XMemMapPhysicalPages(middle, 1, std::ptr::null()), middle);
+            assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(reader.join().expect("the reader never faulted") > 0);
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 }

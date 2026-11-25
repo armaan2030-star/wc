@@ -2392,13 +2392,14 @@ impl State {
             list.defer_host(move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
-                // `crate::watch::title_memory_reading`).
-                let _mapped = crate::watch::title_memory_reading();
+                // `crate::watch::title_memory_reading_range`).
+                let len = n * 3 * stride;
+                let _mapped = crate::watch::title_memory_reading_range(from, len);
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {
                     (
-                        std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
+                        std::slice::from_raw_parts(from as *const u8, len),
                         std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
                     )
                 };

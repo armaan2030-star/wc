@@ -1921,20 +1921,52 @@ mod relay_tests {
     }
 }
 
+/// Default [`late_most`] from the adapter's local VRAM budget
+/// ([`Host::video_memory`]): 64 on cards with a local budget of 6 GiB or less
+/// (e.g. 6 GB cards, where Windows reports ~5 GiB local budget), 128 otherwise
+/// (including when the budget is unknown or zero).
+///
+/// On a 6 GB card, holding up to 128 lists in flight piles work ahead of relay
+/// fetches on the single direct queue and can exhaust the 262,144-slot dynamic
+/// descriptor ring; capping at 64 cuts in-flight queue depth and dynamic slot
+/// pressure in half (issue #431).
+fn default_late_most(video_memory: Option<[u64; 4]>) -> usize {
+    const LOW_VRAM_BUDGET: u64 = 6 << 30;
+    const LOW_VRAM_LISTS: usize = 64;
+    const DEFAULT_LISTS: usize = 256;
+    match video_memory {
+        Some([budget, ..]) if (1..=LOW_VRAM_BUDGET).contains(&budget) => LOW_VRAM_LISTS,
+        _ => DEFAULT_LISTS,
+    }
+}
+
+/// Resolves [`late_most`] from an optional `VICTORY_LATE_WAIT_LISTS` value and
+/// a lazy local VRAM budget query: an explicit parseable override always wins
+/// (clamped to at least 1) without querying DXGI.
+fn resolve_late_most(
+    env: Option<&str>,
+    video_memory: impl FnOnce() -> Option<[u64; 4]>,
+) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| default_late_most(video_memory()))
+        .max(1)
+}
+
 /// The most host lists in the air before the flights are settled
-/// (`VICTORY_LATE_WAIT_LISTS`, 256; `=128` is the value before: with the
-/// relay it stopped the submitting thread twice a frame for 92-103 ms in
-/// all while the card stood idle 64-113 ms a frame, runs 158, 159 and 162;
-/// 32 settled the flights three times a
-/// frame in run 92 and 64 still 1.3-1.7 times in run 99, with 12,919 tables
-/// asked and none refused; watch "tables asked, N refused"): their dynamic
-/// descriptor slots, upload
-/// memory and scratch chunks are held until then, and a frame's lists held
-/// all at once ran the slots out before (run 45).
+/// (`VICTORY_LATE_WAIT_LISTS`, default 256, or 64 when the local VRAM budget is
+/// 6 GiB or less; `=128` was the value before: with the relay it stopped the
+/// submitting thread twice a frame for 92-103 ms in all while the card stood
+/// idle 64-113 ms a frame, runs 158, 159 and 162; 32 settled the flights three
+/// times a frame in run 92 and 64 still 1.3-1.7 times in run 99 on a 12 GB
+/// card, with 12,919 tables asked and none refused; watch "tables asked, N
+/// refused"): their dynamic descriptor slots, upload memory and scratch chunks
+/// are held until then, and a frame's lists held all at once ran the slots out
+/// before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
+        let env = std::env::var("VICTORY_LATE_WAIT_LISTS").ok();
+        resolve_late_most(env.as_deref(), || host().and_then(|h| h.video_memory()))
     })
 }
 
@@ -2335,9 +2367,13 @@ fn late_threads() {
         if let Err(e) = std::thread::Builder::new().name("victory-late-wait".into()).spawn(late_helper) {
             tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow");
         }
+        let vram_budget_mb = host()
+            .and_then(|h| h.video_memory())
+            .map(|[budget, ..]| budget >> 20);
         tracing::info!(
             most = late_most(),
             writes = late_writes(),
+            ?vram_budget_mb,
             "submissions are sent to the card without a wait for each (VICTORY_LATE_WAIT=1)"
         );
         if relay() {
@@ -2579,7 +2615,7 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{continues, default_late_most, join_ranges, resolve_late_most, touches};
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -2627,6 +2663,31 @@ mod late_tests {
         }
         assert!(!touches(&[], 0, usize::MAX));
     }
+
+    #[test]
+fn late_most_scales_with_vram_budget_and_honours_override() {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    // 6 GB card (RTX 2060 reports ~5,187 MiB local DXGI budget) and <= 6 GiB boundary.
+    assert_eq!(default_late_most(Some([5187 * MIB, 0, 0, 0])), 64);
+    assert_eq!(default_late_most(Some([4 * GIB, 0, 0, 0])), 64);
+    assert_eq!(default_late_most(Some([6 * GIB, 0, 0, 0])), 64);
+    // Above 6 GiB (8 GB / 12 GB cards) keeps 256.
+    assert_eq!(default_late_most(Some([6 * GIB + 1, 0, 0, 0])), 256);
+    assert_eq!(default_late_most(Some([7200 * MIB, 0, 0, 0])), 256);
+    assert_eq!(default_late_most(Some([11000 * MIB, 0, 0, 0])), 256);
+    // Missing or zero budget falls back to 256.
+    assert_eq!(default_late_most(None), 256);
+    assert_eq!(default_late_most(Some([0, 100, 0, 0])), 256);
+    // Explicit env var always wins without querying video memory.
+    assert_eq!(resolve_late_most(Some("128"), || panic!("must not query DXGI")), 128);
+    assert_eq!(resolve_late_most(Some(" 32 "), || panic!("must not query DXGI")), 32);
+    assert_eq!(resolve_late_most(Some("0"), || panic!("must not query DXGI")), 1);
+    // Unset or unparseable env falls back to the VRAM-scaled default.
+    assert_eq!(resolve_late_most(None, || Some([5187 * MIB, 0, 0, 0])), 64);
+    assert_eq!(resolve_late_most(Some("bad"), || Some([5187 * MIB, 0, 0, 0])), 64);
+    assert_eq!(resolve_late_most(None, || Some([11000 * MIB, 0, 0, 0])), 256);
+}
 }
 
 /// Whether a title buffer copy that continues the one recorded before it
