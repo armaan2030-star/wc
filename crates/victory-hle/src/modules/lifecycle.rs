@@ -1,8 +1,9 @@
 //! The title's life cycle. A console title is never told it is closing:
 //! quitting it or launching a new game first suspends it (its suspend
 //! routines run, and it has a second to save) and then ends the process.
-//! Closing the title's window does the same here; a new launch then starts
-//! `victory` again, which waits for this process to be gone.
+//! Closing the window (the title's, or the one `victory-gpu` presents in)
+//! does the same here; a new launch then starts `victory` again, which
+//! waits for this process to be gone.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -12,7 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use victory_gpu::window::{Placement, place};
+use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
 use windows_sys::core::{PCSTR, PCWSTR, w};
@@ -59,6 +61,9 @@ pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize)
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
 
+/// The title's windows, with our procedure in front of the title's; a
+/// top-level one larger than the host screen is shrunk to fit
+/// ([`victory_gpu::window::place`]), whatever `[window] size` says.
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
     class: PCWSTR,
@@ -73,11 +78,27 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let asked = Placement::asked(ex_style, style, x, y, width, height);
+    let at = if parent.is_null() {
+        place(asked)
+    } else {
+        asked
+    };
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
-            ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
+            at.ex_style,
+            class,
+            name,
+            at.style,
+            at.x,
+            at.y,
+            at.width,
+            at.height,
+            parent,
+            menu,
+            instance,
+            param,
         )
     };
     hook(hwnd);
@@ -99,53 +120,31 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let asked = Placement::asked(ex_style, style, x, y, width, height);
+    let at = if parent.is_null() {
+        place(asked)
+    } else {
+        asked
+    };
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
-            ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
+            at.ex_style,
+            class,
+            name,
+            at.style,
+            at.x,
+            at.y,
+            at.width,
+            at.height,
+            parent,
+            menu,
+            instance,
+            param,
         )
     };
     hook(hwnd);
     hwnd
-}
-
-/// A console title sizes its window to its render target (
-/// the title: 3840x2160 on a Series X), which can exceed the host's screen.
-/// A top-level window larger than the work area is shrunk to fit, keeping
-/// its proportions, and centred; what it shows is scaled to it (the swap
-/// chain stretches).
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
-    let mut area = RECT::default();
-    // SAFETY: `area` receives the primary monitor's work area.
-    let known =
-        unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
-    let fitted = fit_into(&area, width, height);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
-        return (x, y, width, height);
-    }
-    tracing::info!(width, height, to = ?fitted, "title window fitted to the screen");
-    let (w, h) = fitted;
-    let left = area.left + (area.right - area.left - w) / 2;
-    let top = area.top + (area.bottom - area.top - h) / 2;
-    (left, top, w, h)
-}
-
-/// `width` x `height` scaled down to fit `area`, or unchanged if it fits
-/// (or is `CW_USEDEFAULT`).
-fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
-    let (aw, ah) = (area.right - area.left, area.bottom - area.top);
-    if width <= 0 || height <= 0 || aw <= 0 || ah <= 0 || (width <= aw && height <= ah) {
-        return (width, height);
-    }
-    let scale = f64::min(
-        f64::from(aw) / f64::from(width),
-        f64::from(ah) / f64::from(height),
-    );
-    (
-        (f64::from(width) * scale) as i32,
-        (f64::from(height) * scale) as i32,
-    )
 }
 
 /// Puts our procedure in front of the title's.
@@ -171,7 +170,7 @@ extern "system" fn window_proc(
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
-        end_title("window closed", Box::new(|| {}));
+        window_closed();
         return 0;
     }
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
@@ -192,6 +191,13 @@ extern "system" fn window_proc(
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
         wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
     }
+}
+
+/// The user closed the title's window or the one `victory-gpu` presents in
+/// ([`victory_gpu::window::on_close`]): the title ends as a console ends
+/// it. Returns at once, so a window thread keeps pumping meanwhile.
+pub(crate) fn window_closed() {
+    end_title("window closed", Box::new(|| {}));
 }
 
 /// Suspends the title as the console does when it ends it, runs `then`
@@ -329,22 +335,6 @@ mod tests {
         UnregisterAppStateChangeNotification(a);
         let left: Vec<_> = routines().iter().map(|r| r.0).collect();
         assert_eq!(left, [b]);
-    }
-
-    #[test]
-    fn oversized_windows_shrink_to_the_screen() {
-        let area = RECT {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1040,
-        };
-        assert_eq!(fit_into(&area, 3840, 2160), (1848, 1040));
-        assert_eq!(fit_into(&area, 1280, 720), (1280, 720));
-        assert_eq!(
-            fit_into(&area, wm::CW_USEDEFAULT, 0),
-            (wm::CW_USEDEFAULT, 0)
-        );
     }
 
     #[test]
