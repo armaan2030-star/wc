@@ -149,6 +149,17 @@ cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+The window takes the title's size (the size of the frames it renders),
+shrunk to the primary screen. Set `[window] size` in `victory.toml` (or
+`VICTORY_WINDOW_SIZE`) to `"1920x1080"` or any other client size, or to
+`"fullscreen"` for a borderless window over the whole screen (Alt+F4 closes
+it). Sizes are screen pixels: `victory` is DPI aware, so Windows display
+scaling does not enlarge the window. This sizes only the window: the title
+renders at its own size and its frame is stretched to the window, so a size
+with another aspect ratio distorts the picture. A window the title shows
+itself is only shrunk to fit the screen. Closing the window ends the title
+as a console does: it is suspended first, so it can save.
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
@@ -208,6 +219,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+| `VICTORY_CAPTION=<text>` | replaces the caption of the window we present in and of the title's own top-level windows (default `VIctory` for ours), e.g. a neutral one while the screen is shared |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
