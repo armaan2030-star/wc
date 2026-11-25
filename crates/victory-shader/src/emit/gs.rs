@@ -187,6 +187,10 @@ pub(crate) fn plan(gs: &Program, handoff: &Handoff, outputs: &[SigElement]) -> R
             if msg == GsMessage::Done {
                 continue;
             }
+            // (the lowering handles `s_sendmsg` only)
+            if inst.name() == "s_sendmsghalt" {
+                return Err(unsupported("a halting GS_EMIT or GS_CUT"));
+            }
             messages.insert((b, i), (emits, msg));
             emits += msg.vertices();
         }
@@ -196,6 +200,9 @@ pub(crate) fn plan(gs: &Program, handoff: &Handoff, outputs: &[SigElement]) -> R
     }
     if outputs.iter().any(|e| e.row.is_none()) {
         return Err(unsupported("a geometry output without a register"));
+    }
+    if outputs.iter().any(|e| e.half) {
+        return Err(unsupported("a half-precision geometry output"));
     }
     let record_dwords = outputs.iter().filter_map(|e| e.row).max().map_or(0, |r| 4 * (r + 1));
     let accesses = own_accesses(gs)?;
@@ -380,6 +387,8 @@ pub(crate) mod tests {
             let c = crate::dxbc::Container::parse(dxil).unwrap();
             c.part(FourCC::DXIL).unwrap().data[..4].to_vec()
         };
+        // The host shaders say what they are, not what they were made from.
+        assert_eq!((out.vertex.stage, out.geometry.stage), (HwStage::Vs, HwStage::Gs));
         assert_eq!(kind(&out.vertex.dxil), [0x66, 0, 1, 0]);
         assert_eq!(kind(&out.geometry.dxil), [0x66, 0, 2, 0]);
         // The geometry shader takes what the vertex shader gives, register for
@@ -395,6 +404,14 @@ pub(crate) mod tests {
             gs_out.iter().map(|e| e.row).collect::<Vec<_>>(),
             [Some(0), Some(1), Some(2), Some(3), Some(4)]
         );
+        // The signature says every component the emits store: none is left
+        // unwritten (the read-write mask of each row, byte 25, is empty).
+        let part = crate::dxbc::Container::parse(&out.geometry.dxil).unwrap();
+        let osg1 = part.part(FourCC::OSG1).unwrap().data;
+        let base = u32::from_le_bytes(osg1[4..8].try_into().unwrap()) as usize;
+        for i in 0..gs_out.len() {
+            assert_eq!(osg1[base + 32 * i + 25], 0, "row {i} is marked unwritten");
+        }
         #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
@@ -419,5 +436,44 @@ pub(crate) mod tests {
         let root = host.root_signature(&out.vertex, &ps).unwrap();
         host.pipeline_with_gs(&root, &out.vertex.dxil, Some(&out.geometry.dxil), &ps.dxil)
             .unwrap();
+    }
+
+    #[test]
+    fn halting_messages_and_a_second_table_field_are_refused() {
+        let pair = |words: &[u32]| {
+            let gs = container_parts(&[(HwStage::Gs, &bytes(words))], &[(FourCC::OSG1, &outputs())]);
+            super::super::translate_merged_gs(&es_container(), &gs)
+        };
+        let what = |r: Result<super::super::MergedShaders, ShaderError>| match r {
+            Err(Unsupported { what, .. }) => what,
+            other => panic!("{:?}", other.map(|_| ())),
+        };
+        // The first emit as s_sendmsghalt.
+        let mut halt = gs_words(3);
+        let emit = 0xBF90_0000 | (2 | 2 << 4);
+        let at = halt.iter().position(|&w| w == emit).unwrap();
+        halt[at] = 0xBF91_0000 | (2 | 2 << 4);
+        assert_eq!(what(pair(&halt)), "a halting GS_EMIT or GS_CUT");
+        // s_load_dword s1, s[8:9], 0xbc after the first table load.
+        let mut two = gs_words(3);
+        let at = two.iter().position(|&w| w == 0x7E18_0200).unwrap();
+        two.splice(at + 1..at + 1, [0xF400_0044, 0xFA00_00BC]);
+        assert_eq!(what(pair(&two)), "more than one field read from the runtime table");
+        // The same field twice is the one base.
+        let mut same = gs_words(3);
+        same.splice(at + 1..at + 1, [0xF400_0044, 0xFA00_00B8]);
+        assert!(pair(&same).is_ok());
+    }
+
+    #[test]
+    fn a_half_precision_output_is_refused() {
+        let mut rows = outputs();
+        // The last row's component type (offset 16 in its entry) as a
+        // 16-bit float.
+        let base = u32::from_le_bytes(rows[4..8].try_into().unwrap()) as usize;
+        rows[base + 32 * 4 + 16..base + 32 * 4 + 20].copy_from_slice(&6u32.to_le_bytes());
+        let gs = container_parts(&[(HwStage::Gs, &bytes(&gs_words(3)))], &[(FourCC::OSG1, &rows)]);
+        let r = super::super::translate_merged_gs(&es_container(), &gs);
+        assert!(matches!(r, Err(Unsupported { what, .. }) if what == "a half-precision geometry output"), "{:?}", r.map(|_| ()));
     }
 }

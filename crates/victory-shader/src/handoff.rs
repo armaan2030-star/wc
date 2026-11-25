@@ -354,6 +354,10 @@ pub fn vertex_reads(p: &Program) -> Result<Vec<VertexRead>, ShaderError> {
             if vertex >= MAX_VERTICES {
                 return Err(unsupported("a geometry input of more than three vertices"));
             }
+            // (the half is a dword offset: a byte address is its four times)
+            if lin.mul != 4 {
+                return Err(unsupported("a vertex offset not scaled to bytes"));
+            }
             let Some(count) = width(name) else {
                 return Err(unsupported("an LDS read of a vertex record that is not whole dwords"));
             };
@@ -614,6 +618,14 @@ pub(crate) mod tests {
         let r = vertex_reads(&program(&gs_words())).unwrap();
         let at: Vec<_> = r.iter().map(|r| (r.vertex, r.dword, r.count, r.reg)).collect();
         assert_eq!(at, [(0, 0, 4, 4), (1, 4, 1, 8)]);
+    }
+
+    #[test]
+    fn an_input_offset_is_scaled_to_bytes() {
+        // v_lshlrev_b32 v2, 3, v2 instead of 2: not a dword offset.
+        let mut words = gs_words();
+        words[2] = vop2(V_LSHLREV, 2, 131, 2);
+        assert!(vertex_reads(&program(&words)).is_err());
     }
 
     #[test]
