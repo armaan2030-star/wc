@@ -137,7 +137,7 @@ struct Window {
 }
 
 /// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+const WINDOW_MOST: u64 = 512;
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
