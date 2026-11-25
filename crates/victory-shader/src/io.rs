@@ -214,12 +214,29 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 .collect();
             (loaded, &inputs[..], &[][..])
         }
-        (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
-            let mut loaded = vec![
-                (Reg::V(0), Input::VertexId),
-                (Reg::V(2), Input::PrimitiveId),
-                (Reg::V(3), Input::InstanceId),
-            ];
+        // The ES half of a merged stage taken as a vertex shader whose
+        // exports are the records it writes (`handoff`): its vertex id in v0
+        // as the hardware VS gets it (not checked on the title's programs),
+        // the runtime table pointer where the layout leaves its dwords free.
+        (StageIo::Vs { inputs, outputs }, HwStage::Vs | HwStage::Es) => {
+            let mut loaded = if native.stage == HwStage::Es {
+                let first = native.stage.user_sgpr(crate::merged::RUNTIME_TABLE);
+                let taken = native.layout.iter().any(|p| {
+                    let at = u32::from(native.stage.user_sgpr(p.user_data));
+                    at < u32::from(first) + 2 && u32::from(first) < at + p.sgprs
+                });
+                let mut v = vec![(Reg::V(0), Input::VertexId)];
+                if !taken {
+                    v.extend((0..2u8).map(|k| (Reg::S(first + k), Input::RuntimeTable(k))));
+                }
+                v
+            } else {
+                vec![
+                    (Reg::V(0), Input::VertexId),
+                    (Reg::V(2), Input::PrimitiveId),
+                    (Reg::V(3), Input::InstanceId),
+                ]
+            };
             for i in inputs {
                 for channel in (0..4).filter(|c| i.mask >> c & 1 != 0) {
                     let input = Input::Attribute {

@@ -329,6 +329,62 @@ pub fn vertex_reads(p: &Program) -> Result<Vec<VertexRead>, ShaderError> {
     Ok(out)
 }
 
+/// A GS program's own LDS access: it writes its output records there before
+/// it emits them, and may read them back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Access {
+    pub site: Site,
+    pub write: bool,
+    /// The address is `base * mul + add` plus the instruction's offset
+    /// (`byte`, in total, the constant part).
+    pub base: Base,
+    pub mul: u32,
+    pub byte: u32,
+    pub count: u32,
+    /// The first VGPR of the data written or of the destination.
+    pub reg: u8,
+}
+
+/// The LDS accesses of a GS program that are not reads of input vertices, in
+/// code order. Fails on any other LDS operation (atomics, paired reads and
+/// writes, bytes and halves).
+pub fn own_accesses(p: &Program) -> Result<Vec<Access>, ShaderError> {
+    let eval = Eval::new(p);
+    let mut out = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            let Fields::Ds { dst, addr, data, offset0, offset1, gds } = &inst.fields else {
+                continue;
+            };
+            let name = inst.name();
+            if no_memory(name) {
+                continue;
+            }
+            let write = name.starts_with("ds_write");
+            let Some(count) = width(name).filter(|_| !gds) else {
+                return Err(unsupported("an LDS operation of the GS half beyond whole-dword reads and writes"));
+            };
+            let Some(Operand::Vector { reg: a, .. }) = *addr else {
+                return Err(unsupported("an LDS access without an address"));
+            };
+            let lin = eval.value(inst.read(Reg::V(a)).ok_or(unsupported("an unread LDS address"))?, 0);
+            if matches!(lin.base, Base::Half { .. }) && !write {
+                continue; // an input vertex ([`vertex_reads`])
+            }
+            let reg = match (write, data.first(), dst) {
+                (true, Some(Operand::Vector { reg, .. }), _) | (false, _, Some(Operand::Vector { reg, .. })) => *reg,
+                _ => return Err(unsupported("an LDS access without a register")),
+            };
+            let byte = lin.add.wrapping_add(u32::from(*offset0) | u32::from(*offset1) << 8);
+            if byte % 4 != 0 {
+                return Err(unsupported("an LDS access off a dword"));
+            }
+            out.push(Access { site: (b, i), write, base: lin.base, mul: lin.mul, byte, count, reg });
+        }
+    }
+    Ok(out)
+}
+
 /// An ES record and the reads of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handoff {
@@ -481,6 +537,27 @@ pub(crate) mod tests {
             S_ENDPGM,
         ];
         assert!(vertex_reads(&program(&words)).is_err());
+    }
+
+    #[test]
+    fn the_gs_halfs_own_memory_is_its_writes_and_reads_back() {
+        // v_lshlrev_b32 v2, 2, v1 (a slot of its own), a 16-byte write at
+        // +8 of v[4:7], a 4-byte read back at +12 into v9.
+        let words = [
+            vop2(V_LSHLREV, 2, 130, 5),
+            ds(DS_WRITE_B128, 8),
+            ds_regs(2, 4, 0),
+            ds(DS_READ_B32, 12),
+            ds_regs(2, 0, 9),
+            S_ENDPGM,
+        ];
+        let a = own_accesses(&program(&words)).unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!((a[0].write, a[0].byte, a[0].count, a[0].reg), (true, 8, 4, 4));
+        assert_eq!((a[1].write, a[1].byte, a[1].count, a[1].reg), (false, 12, 1, 9));
+        assert_eq!((a[0].base, a[0].mul), (a[1].base, a[1].mul));
+        // An input vertex read is not among them.
+        assert!(own_accesses(&program(&gs_words())).unwrap().is_empty());
     }
 
     #[test]

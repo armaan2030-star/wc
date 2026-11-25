@@ -307,7 +307,8 @@ pub fn run(
     );
     println!(
         "geometry     {} programs: {} resources traced, {} I/O raised, {} stopped at {} \
-         (no geometry emission yet; not among the failures below)",
+         (emitted with the ES half it is linked with, which is in another \
+         container; not among the failures below)",
         t.gs_programs,
         t.gs_tracked,
         t.gs_raised,
@@ -520,8 +521,10 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                         continue;
                     }
                     if geometry {
-                        // No geometry emission yet: counted on its own line,
-                        // anything else it fails with is a failure.
+                        // A geometry program is emitted with its ES half
+                        // (`emit::translate_merged_gs`), which is in another
+                        // container: counted on its own line, anything else
+                        // it fails with is a failure.
                         match emit::emit(container, &p, &program, &s, &i, &r) {
                             Err(ShaderError::Unsupported { what, .. }) if what == emit::GS_EMIT => {
                                 t.gs_stopped += 1;

@@ -801,6 +801,17 @@ pub(crate) mod tests {
         container_lds(programs, 0)
     }
 
+    /// [`container`] with more parts next to the `DXIL` one (signatures).
+    pub(crate) fn container_parts(
+        programs: &[(HwStage, &[u8])],
+        extra: &[(crate::dxbc::FourCC, &[u8])],
+    ) -> Vec<u8> {
+        let data = part(&[(KIND_NATIVE, &xbch(&fssm_lds(programs, 0)))]);
+        let mut parts = vec![(crate::dxbc::FourCC::DXIL, &data[..])];
+        parts.extend_from_slice(extra);
+        crate::dxbc::build(&parts)
+    }
+
     /// [`container`] whose records say they allocate `lds` bytes of LDS.
     pub(crate) fn container_lds(programs: &[(HwStage, &[u8])], lds: u32) -> Vec<u8> {
         let data = part(&[(KIND_NATIVE, &xbch(&fssm_lds(programs, lds)))]);
