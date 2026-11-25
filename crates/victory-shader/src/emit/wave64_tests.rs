@@ -113,6 +113,7 @@ fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Re
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
     Ok(HostShader {
+        dispatch_contract: crate::emit::DispatchContract::None,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

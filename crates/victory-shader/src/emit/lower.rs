@@ -24,6 +24,10 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+mod prefilter;
+mod split_lds;
+
+use split_lds::{VISIBILITY_SNAPSHOT_SLOT, lds_snapshot_meetings, split_lds_on, visibility_initializer};
 
 type Why = &'static str;
 
@@ -59,6 +63,7 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    pub dispatch_contract: super::DispatchContract,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -87,17 +92,41 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    if let Some(lowered) = prefilter::try_lower(parts) {
+        return Ok(lowered);
+    }
     let mut bad = HashMap::new();
+    let mut try_snapshot = split_lds_on()
+        && host_max_wave() == 32
+        && !LOCAL_WAVES.get()
+        && super::group_sync() != 0
+        && visibility_initializer(parts);
     loop {
-        match Lower::new(parts, &bad).run() {
+        let prior_needs = NEEDS.with_borrow(Vec::len);
+        let lower = Lower::new(parts, &bad, try_snapshot, false);
+        let snapshot = lower.lds_snapshot;
+        let result = lower.run();
+        if snapshot && result.is_err() {
+            NEEDS.with_borrow_mut(|n| n.truncate(prior_needs));
+        }
+        match result {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
+                    if snapshot {
+                        try_snapshot = false;
+                        bad.clear();
+                        continue;
+                    }
                     return Err(ShaderError::Unsupported {
                         offset: 0,
                         what: "a phi that does not settle",
                     });
                 }
+            }
+            Err(Stop::Fail(_)) if snapshot => {
+                try_snapshot = false;
+                bad.clear();
             }
             Err(Stop::Fail(e)) => return Err(e),
         }
@@ -239,6 +268,9 @@ struct Lower<'a> {
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+    /// A fixed LDS load used as a group-wide snapshot. The final DXIL must certify its meetings.
+    lds_snapshot: bool,
+    prefilter: Option<prefilter::Witness>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
@@ -1226,7 +1258,12 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        try_snapshot: bool,
+        prefilter: bool,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1248,6 +1285,7 @@ impl<'a> Lower<'a> {
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
+        let mut lds_snapshot = false;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
@@ -1314,6 +1352,15 @@ impl<'a> Lower<'a> {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
+                        if !lds_ok
+                            && try_snapshot
+                            && !console_lanes
+                            && let Some(meet) = lds_snapshot_meetings(p, x.st, &all, cs.lds_bytes())
+                        {
+                            lds_meet = Some(meet);
+                            lds_snapshot = true;
+                            lds_ok = true;
+                        }
                         if !lds_ok {
                             // (the blocks whose LDS accesses not every lane runs: with the
                             // branches around them taken wave-wide they get their barriers)
@@ -1374,8 +1421,9 @@ impl<'a> Lower<'a> {
                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
                 }
             }
-            if wave == 32 && x.native.wave64 {
-                // console threads go to host waves in the order the waves take them (`wave_base`)
+            if wave == 32 && x.native.wave64 && !lds_snapshot {
+                // Console threads go to host waves in the order the waves take them (`wave_base`).
+                // The verified snapshot has no console-lane dependencies and uses native thread IDs.
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
@@ -1519,6 +1567,8 @@ impl<'a> Lower<'a> {
             console_lanes,
             split_lds,
             lds_meet,
+            lds_snapshot,
+            prefilter: prefilter.then(prefilter::Witness::default),
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
@@ -2137,6 +2187,10 @@ impl<'a> Lower<'a> {
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
+        if self.prefilter.is_some() {
+            self.prefilter_counter_init()?;
+            self.block[order[0]] = Some(self.s.entry);
+        }
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -2201,8 +2255,23 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let prefilter = self
+            .prefilter
+            .map(|p| {
+                p.certificate()
+                    .filter(|_| wave_size == Some(32))
+                    .ok_or_else(|| unsupported(0, "an incomplete prefilter exchange"))
+            })
+            .transpose()?;
         Ok(Lowered {
             wave_size,
+            dispatch_contract: if prefilter.is_some() {
+                super::DispatchContract::Prefilter
+            } else if self.lds_snapshot {
+                super::DispatchContract::Visibility
+            } else {
+                super::DispatchContract::None
+            },
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -2211,7 +2280,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            dxil: self
+                .s
+                .finish_checked(self.lds_snapshot.then_some(VISIBILITY_SNAPSHOT_SLOT), prefilter.as_ref())
+                .ok_or_else(|| unsupported(0, "an LDS snapshot without a convergence proof"))?,
             user_data,
             samplers: self.samplers,
         })
@@ -3576,10 +3648,15 @@ impl<'a> Lower<'a> {
         let (e, i32t) = (self.s.entry, self.s.t.i32);
         let lds = self.s.lds();
         let k = self.s.m.i32(slot);
-        let ptr = self.s.m.element(e, lds, k);
         let zero = self.s.m.i32(0);
-        self.s.m.store(e, ptr, zero);
-        self.group_sync(e);
+        if self.prefilter.is_none() {
+            let ptr = self.s.m.element(e, lds, k);
+            self.s.m.store(e, ptr, zero);
+        }
+        let ready = self.group_sync(e);
+        if let Some(proof) = &mut self.prefilter {
+            proof.counter_ready = Some(ready);
+        }
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
         let k32 = self.s.m.i32(32);
@@ -3628,10 +3705,10 @@ impl<'a> Lower<'a> {
     }
 
     /// A group barrier with an LDS fence in `block`.
-    fn group_sync(&mut self, block: usize) {
+    fn group_sync(&mut self, block: usize) -> V {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
-        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode])
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -4498,8 +4575,17 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
+                    // Keep the address of a masked-out lane from issuing a
+                    // speculative load. The meeting stands outside this guard.
+                    let at = self.begin_guarded(if self.lds_snapshot { guard } else { None });
                     let p = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
+                    let x = if at.is_some() {
+                        let zero = self.s.m.i32(0);
+                        self.end_guarded(at, &[(x, zero)])[0]
+                    } else {
+                        x
+                    };
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -4736,12 +4822,21 @@ impl<'a> Lower<'a> {
                 }
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
-                self.s
+                let barrier = self
+                    .s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                if let Some(proof) = &mut self.prefilter {
+                    proof.native_barrier(offset, barrier);
+                }
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
-            Fields::Smem { .. } => self.smem(inst, (b, i)),
+            Fields::Smem { .. } => self.smem(inst, (b, i)).and_then(|()| {
+                if self.prefilter.is_some() && offset == 0x78 {
+                    self.prefilter_gate(inst)?;
+                }
+                Ok(())
+            }),
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
             Fields::Valu(_) => self.valu(inst, b, i),
             Fields::Vintrp { .. } => self.interp(inst, (b, i)),
@@ -7367,10 +7462,13 @@ impl<'a> Lower<'a> {
                     self.s.m.store(self.cur, ptr, a);
                     self.end_guarded(at, &[]);
                     let c2 = self.cur;
-                    self.group_sync(c2);
+                    let before = self.group_sync(c2);
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    self.group_sync(c2);
+                    let after = self.group_sync(c2);
+                    if let Some(proof) = &mut self.prefilter {
+                        proof.exchange(inst.machine.offset, before, after);
+                    }
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
@@ -10856,6 +10954,7 @@ impl<'a> Lower<'a> {
                 }
                 Term::CondBr(cond, t, f)
             }
+            LaneExit::End if self.prefilter.is_some() => Term::Br(self.abort_block()),
             LaneExit::End => {
                 if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
                     // A lane leaving without its final export was killed.

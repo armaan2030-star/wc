@@ -14,13 +14,20 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{DispatchContract, HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+
+fn append_switch(bytes: &mut Vec<u8>, name: &str, value: Option<&std::ffi::OsStr>) {
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.push(b'=');
+    if let Some(value) = value { bytes.extend_from_slice(value.as_encoded_bytes()); }
+    bytes.push(0);
+}
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
@@ -54,6 +61,14 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                let host = crate::host::host();
+                bytes.push(host.map_or(0, |h| 1 + u8::from(h.warp)));
+                let lanes = host.and_then(|h| h.wave_lanes.as_ref());
+                bytes.push(u8::from(lanes.is_some()));
+                if let Some(lanes) = lanes {
+                    bytes.extend_from_slice(&lanes.start().to_le_bytes());
+                    bytes.extend_from_slice(&lanes.end().to_le_bytes());
+                }
                 // So is the view heap's null slot (it differs by host GPU):
                 // a translation cached without the clamp must not be served.
                 crate::descriptor::host::probe_view_limit();
@@ -65,17 +80,16 @@ fn build() -> &'static [u8; 32] {
                 // served the translations an earlier run of the same
                 // executable had cached with the switch unset.
                 for name in [
+                    "VICTORY_SPLIT_LDS",
+                    "VICTORY_SPLIT_PREFILTER",
+                    "VICTORY_FIRSTLANE_OWN",
                     "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_LOCAL",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
                 ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
+                    append_switch(&mut bytes, name, std::env::var_os(name).as_deref());
                 }
                 // And which clean-up passes ran over the translated code.
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
@@ -157,7 +171,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -199,6 +213,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
     word(&mut out, stage);
+    word(&mut out, match s.dispatch_contract { DispatchContract::None => 0, DispatchContract::Visibility => 1, DispatchContract::Prefilter => 2 });
     word(&mut out, s.dxil.len() as u32);
     out.extend(&s.dxil);
     word(&mut out, s.user_data.len() as u32);
@@ -272,6 +287,12 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         return None;
     }
     let stage = *STAGES.get(r.word()? as usize)?;
+    let dispatch_contract = match r.word()? {
+        0 => DispatchContract::None,
+        1 if stage == HwStage::Cs => DispatchContract::Visibility,
+        2 if stage == HwStage::Cs => DispatchContract::Prefilter,
+        _ => return None,
+    };
     let dxil = r.list()?;
     let n = r.word()? as usize;
     let mut user_data = Vec::with_capacity(n.min(256));
@@ -318,6 +339,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     r.0.is_empty().then_some(HostShader {
         stage,
+        dispatch_contract,
         dxil,
         user_data,
         samplers,
@@ -333,9 +355,35 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cached_shader_preserves_dispatch_contract() {
+        let mut compute = shader();
+        compute.stage = HwStage::Cs;
+        for contract in [DispatchContract::None, DispatchContract::Visibility, DispatchContract::Prefilter] {
+            compute.dispatch_contract = contract;
+            assert_eq!(decode(&encode(&compute)).unwrap().dispatch_contract, contract);
+        }
+        compute.stage = HwStage::Ps;
+        for contract in [DispatchContract::Visibility, DispatchContract::Prefilter] {
+            compute.dispatch_contract = contract;
+            assert!(decode(&encode(&compute)).is_none());
+        }
+    }
+
+    #[test]
+    fn split_prefilter_setting_changes_cache_key_material() {
+        let mut off = Vec::new();
+        let mut on = Vec::new();
+        append_switch(&mut off, "VICTORY_SPLIT_PREFILTER", None);
+        append_switch(&mut on, "VICTORY_SPLIT_PREFILTER", Some(std::ffi::OsStr::new("1")));
+        assert_ne!(blake3::hash(&off), blake3::hash(&on));
+    }
+
+
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
+            dispatch_contract: DispatchContract::None,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,

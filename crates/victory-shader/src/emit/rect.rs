@@ -406,6 +406,7 @@ mod tests {
             s.m.terminate(b, Term::Ret);
         }
         let host = |stage, s: Shader| super::super::HostShader {
+            dispatch_contract: crate::emit::DispatchContract::None,
             stage,
             dxil: s.finish(),
             user_data: Vec::new(),

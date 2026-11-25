@@ -215,10 +215,23 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Restrictions on an executing compute dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchContract {
+    None,
+    /// Direct dispatch with one X group and an immutable table CBV.
+    Visibility,
+    /// Experimental prefilter: unaligned dimensions suppress the whole dispatch.
+    /// Requires a direct dispatch with Z = 1 and an immutable 80-byte CBV.
+    Prefilter,
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
     pub stage: HwStage,
+    /// Execution and immutable binding requirements for this compute shader.
+    pub dispatch_contract: DispatchContract,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
@@ -639,6 +652,7 @@ fn emit_program(
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
+        dispatch_contract: l.dispatch_contract,
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l
@@ -1024,6 +1038,7 @@ mod tests {
             return;
         };
         let ps = super::HostShader {
+            dispatch_contract: DispatchContract::None,
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
             user_data: Vec::new(),
@@ -1036,6 +1051,7 @@ mod tests {
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
+                dispatch_contract: DispatchContract::None,
                 stage,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
@@ -1325,6 +1341,7 @@ mod tests {
         #[cfg(windows)]
         if let Ok(host) = super::host::Host::new(false) {
             let cs = super::HostShader {
+                dispatch_contract: DispatchContract::None,
                 stage: super::HwStage::Cs,
                 dxil,
                 user_data: l.user_data,

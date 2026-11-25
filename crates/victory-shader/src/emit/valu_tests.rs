@@ -172,6 +172,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     .expect("lower");
 
     let shader = HostShader {
+        dispatch_contract: crate::emit::DispatchContract::None,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -1560,6 +1561,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        dispatch_contract: crate::emit::DispatchContract::None,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -1620,5 +1622,76 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
                 want.to_bits(),
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "requires VICTORY_PREFILTER_CAPTURE, VICTORY_SPLIT_PREFILTER=1, and Wave32 hardware"]
+fn captured_prefilter_dispatch_respects_tile_bounds() {
+    use super::DispatchContract;
+    use super::host::Stride;
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let path = std::env::var_os("VICTORY_PREFILTER_CAPTURE").expect("local prefilter capture");
+    let container = std::fs::read(path).expect("read prefilter capture");
+    let previous = lower::TEST_HOST_WAVE.replace(Some(32));
+    let previous_limit = super::shader::TEST_VIEW_LIMIT.replace(Some(999_999));
+    let shader = super::translate(&container);
+    super::shader::TEST_VIEW_LIMIT.set(previous_limit);
+    lower::TEST_HOST_WAVE.set(previous);
+    let shader = shader.expect("translate captured prefilter");
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let psv = container.part(crate::FourCC::PSV0).unwrap().data;
+    assert_eq!([20, 24].map(|offset| crate::dxbc::u32_at(psv, offset).unwrap()), [32, 32]);
+    assert_eq!(shader.dispatch_contract, DispatchContract::Prefilter);
+    let host = Host::new(false).expect("Wave32 hardware");
+    let (root, pso) = host.compute_pipeline(&shader).expect("prefilter pipeline");
+
+    const LOCAL_TABLE: u32 = 160;
+    let mut constants = vec![0; shader.user_data_dwords().max(1) as usize];
+    for data in &shader.user_data {
+        constants[data.index as usize] = match (data.root, data.slot) {
+            (RootType::Table, 0) => 0,
+            (RootType::Table, 1) => LOCAL_TABLE * 32,
+            (RootType::Constants, 2) => 5,
+            (root, slot) => panic!("unexpected prefilter user data {root:?} at slot {slot}"),
+        };
+    }
+
+    let raw = [1.0f32.to_bits(); 4];
+    let color: [[f32; 4]; 32 * 32] = std::array::from_fn(|i| {
+        [0.125 + (i % 32) as f32 / 64.0, 0.125 + (i / 32) as f32 / 64.0, 0.25, 1.0]
+    });
+    let dispatch = |width: u32, height: u32, groups: [u32; 3]| {
+        let mut cbv = [0; 20];
+        cbv[0] = width;
+        cbv[1] = height;
+        cbv[6] = (1.0f32 / 32.0).to_bits();
+        cbv[7] = cbv[6];
+        cbv[14] = 1;
+        let mut views = (0..LOCAL_TABLE)
+            .map(|_| View::Buffer { data: &raw, stride: Stride::Raw })
+            .collect::<Vec<_>>();
+        views[159] = View::Texture(1, 1, &color[..1]);
+        views.extend([
+            View::Texture(32, 32, &color), View::Texture(32, 32, &color), View::Texture(32, 32, &color),
+            View::TextureUav(4, 4), View::TextureUav(16, 16), View::TextureUav(64, 64),
+            View::TextureUav(32, 32), View::TextureUav(2, 2), View::TextureUav(8, 8),
+            View::Cbv(&cbv),
+        ]);
+        host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(constants.clone()))],
+            views: &views,
+            samplers: &[],
+            groups,
+        }).expect("prefilter dispatch and readback")
+    };
+    let valid = dispatch(16, 16, [1, 1, 1]);
+    assert_eq!(valid.len(), 6);
+    assert!(valid.iter().all(|mip| mip.iter().any(|&value| value != 0)));
+    assert!(valid.iter().flatten().all(|&value| f32::from_bits(value).is_finite()));
+    assert_eq!(dispatch(16, 16, [2, 2, 1]), valid);
+    for (width, height) in [(0, 16), (16, 0), (8, 16), (16, 4)] {
+        assert!(dispatch(width, height, [1, 1, 1]).iter().flatten().all(|&value| value == 0));
     }
 }

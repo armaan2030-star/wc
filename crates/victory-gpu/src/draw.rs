@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::DispatchContract;
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
@@ -23,6 +24,104 @@ use windows::core::Interface;
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+
+fn dispatch_contract_allows(contract: DispatchContract, groups: [u32; 3]) -> bool {
+    groups.contains(&0) || match contract {
+        DispatchContract::None => true,
+        DispatchContract::Visibility => groups[0] == 1,
+        DispatchContract::Prefilter => groups[2] == 1,
+    }
+}
+
+fn indirect_contract_allows(required: bool, max: u32) -> bool {
+    !required || max == 0
+}
+
+/// A constrained shader must name at least one CBV, all through fixed table
+/// entries whose descriptor offsets are aligned to a title heap slot.
+fn immutable_cbv_metadata(used: &[UsedResource], contract: DispatchContract) -> bool {
+    if contract == DispatchContract::Prefilter && !used.iter().any(|u|
+        u.kind == ResourceType::Cbv && u.root == RootType::Table && u.slot == 1 && u.table_offset_dwords == 72)
+    { return false; }
+    let mut found = false;
+    for u in used.iter().filter(|u| u.kind == ResourceType::Cbv) {
+        found = true;
+        if u.root != RootType::Table || !u.table_offset_dwords.is_multiple_of(8)
+            || u.table_offset_dwords / 8 >= crate::descriptor::host::DYNAMIC
+        {
+            return false;
+        }
+    }
+    found
+}
+
+fn valid_immutable_cbv(address: u64, size: u32, minimum: u32) -> bool {
+    address != 0 && (minimum..=65536).contains(&size)
+        && address.checked_add(u64::from(size)).is_some()
+        && usize::try_from(address).is_ok()
+}
+
+fn immutable_cbv_tables_complete(used: &[UsedResource], made: &[(u8, u32)], contract: DispatchContract) -> bool {
+    immutable_cbv_metadata(used, contract) && !made.iter().any(|m| m.1 == u32::MAX)
+        && used.iter().filter(|u| u.kind == ResourceType::Cbv)
+            .all(|u| made.iter().any(|&(slot, _)| slot == u.slot))
+}
+
+#[cfg(test)]
+mod dispatch_contract_tests {
+    use super::*;
+    #[test]
+    fn direct_contracts_and_noops() {
+        assert!(dispatch_contract_allows(DispatchContract::Visibility, [1, 3, 2]));
+        assert!(!dispatch_contract_allows(DispatchContract::Visibility, [2, 1, 1]));
+        assert!(dispatch_contract_allows(DispatchContract::Prefilter, [2, 3, 1]));
+        assert!(!dispatch_contract_allows(DispatchContract::Prefilter, [1, 1, 2]));
+        assert!(dispatch_contract_allows(DispatchContract::None, [2, 3, 2]));
+        for c in [DispatchContract::Visibility, DispatchContract::Prefilter] {
+            assert!(dispatch_contract_allows(c, [0, 3, 2]));
+            assert!(dispatch_contract_allows(c, [2, 0, 2]));
+            assert!(dispatch_contract_allows(c, [2, 3, 0]));
+        }
+        assert!(!indirect_contract_allows(true, 1));
+        assert!(!indirect_contract_allows(true, u32::MAX));
+        assert!(indirect_contract_allows(true, 0));
+        assert!(indirect_contract_allows(false, 1));
+    }
+
+    #[test]
+    fn visibility_still_requires_a_fixed_table_cbv() {
+        let cbv = UsedResource { kind: ResourceType::Cbv, root: RootType::Table,
+            table_offset_dwords: 96, lower_bound: 7, stride: 0, dwords: 4, user_data: 4, slot: 0 };
+        let contract = DispatchContract::Visibility;
+        assert!(!immutable_cbv_metadata(&[], contract));
+        assert!(immutable_cbv_metadata(&[cbv], contract));
+        assert!(!immutable_cbv_metadata(&[UsedResource { root: RootType::Descriptor, ..cbv }], contract));
+        assert!(!immutable_cbv_metadata(&[UsedResource { table_offset_dwords: 97, ..cbv }], contract));
+        assert!(valid_immutable_cbv(0x10010, 16, 16));
+        assert!(!valid_immutable_cbv(0, 16, 16));
+        assert!(!valid_immutable_cbv(0x10000, 15, 16));
+        assert!(!valid_immutable_cbv(0x10000, 65537, 16));
+        assert!(!immutable_cbv_tables_complete(&[cbv], &[(0, u32::MAX)], contract));
+        assert!(immutable_cbv_tables_complete(&[cbv], &[(0, 64)], contract));
+    }
+
+    #[test]
+    fn prefilter_requires_fixed_cbv_and_80_bytes() {
+        let cbv = UsedResource { kind: ResourceType::Cbv, root: RootType::Table,
+            table_offset_dwords: 72, lower_bound: 0, stride: 0, dwords: 4, user_data: 0, slot: 1 };
+        assert!(!immutable_cbv_metadata(&[], DispatchContract::Prefilter));
+        assert!(immutable_cbv_metadata(&[cbv], DispatchContract::Prefilter));
+        let mut bad = cbv; bad.slot = 0;
+        assert!(!immutable_cbv_metadata(&[bad], DispatchContract::Prefilter));
+        bad = cbv; bad.table_offset_dwords = 64;
+        assert!(!immutable_cbv_metadata(&[bad], DispatchContract::Prefilter));
+        assert!(!valid_immutable_cbv(0x10000, 79, 80));
+        assert!(valid_immutable_cbv(0x10000, 80, 80));
+        assert!(!valid_immutable_cbv(u64::MAX - 7, 80, 80));
+        assert!(!immutable_cbv_tables_complete(&[cbv], &[], DispatchContract::Prefilter));
+        assert!(immutable_cbv_tables_complete(&[cbv], &[(1, 64)], DispatchContract::Prefilter));
+    }
+}
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -913,9 +1012,26 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            let contract = if compute { t.host.dispatch_contract } else { DispatchContract::None };
+            let strict_cbv = contract != DispatchContract::None;
+            if strict_cbv && (!immutable_cbv_metadata(&t.used, contract)
+                || stage.user_data.is_none()
+                || !stage.root_cbvs.is_empty()
+                || t.used.iter().filter(|u| u.kind == ResourceType::Cbv).any(|u| {
+                    !t.host.user_data.iter().any(|data| data.root == RootType::Table && data.slot == u.slot)
+                        || t.host.root_indexed_views.iter().any(|index| index.table_slot == u.slot)
+                }))
+            {
+                once!("constrained dispatch dropped: CBV metadata cannot be staged immutably");
+                return false;
+            }
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, contract);
             STORES.set(true);
+            if strict_cbv && !immutable_cbv_tables_complete(&t.used, &made, contract) {
+                once!("constrained dispatch dropped: required CBV could not be staged");
+                return false;
+            }
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1738,6 +1854,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        if [x, y, z].contains(&0) { return; }
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -1773,6 +1890,11 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if !dispatch_contract_allows(p.dispatch_contract(), [x, y, z]) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            once!(x, y, z, contract = ?p.dispatch_contract(), "dispatch dropped: translated shader dispatch contract violated");
+            return;
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -1786,6 +1908,18 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if p.dispatch_contract() != DispatchContract::None {
+            static VISIBILITY_LOGGED: std::sync::Once = std::sync::Once::new();
+            static PREFILTER_LOGGED: std::sync::Once = std::sync::Once::new();
+            let logged = match p.dispatch_contract() {
+                DispatchContract::Visibility => &VISIBILITY_LOGGED,
+                DispatchContract::Prefilter => &PREFILTER_LOGGED,
+                DispatchContract::None => unreachable!(),
+            };
+            logged.call_once(|| tracing::info!(x, y, z, pipeline = %p.name,
+                contract = ?p.dispatch_contract(), "constrained compute dispatch recorded"));
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1943,7 +2077,9 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
+        contract: DispatchContract,
     ) -> Vec<(u8, u32)> {
+        let strict_cbv = contract != DispatchContract::None;
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -2029,7 +2165,7 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
+            let key = (!strict_cbv).then(|| {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 for k in 0..n {
@@ -2038,8 +2174,8 @@ impl State {
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
                 (table, n, h.finish())
-            };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            });
+            if let Some(&first) = key.as_ref().and_then(|key| self.fresh_tables.get(key)) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -2066,7 +2202,7 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            if let Some(key) = key { self.fresh_tables.insert(key, first); }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -2077,16 +2213,47 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let required_cbv = strict_cbv && entries.iter().any(|u|
+                    u.kind == ResourceType::Cbv && u.table_offset_dwords / 8 == k);
+                let handle = table + u64::from(k) * 32;
+                let view = if strict_cbv {
+                    let _mapped = crate::watch::title_memory_reading();
+                    if !crate::texture::committed(handle as *const u8, 12) {
+                        made.push((slot, u32::MAX));
+                        return made;
+                    }
+                    crate::descriptor::view(handle)
+                } else {
+                    crate::descriptor::view(handle)
+                };
+                match view {
                     Some(View::Constant(address, size)) => {
+                        if required_cbv && (!valid_immutable_cbv(address, size, if contract == DispatchContract::Prefilter && slot == 1 && k == 9 { 80 } else { 16 })
+                            || !crate::texture::committed(address as *const u8, size as usize))
+                        {
+                            made.push((slot, u32::MAX));
+                            return made;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                            if required_cbv {
+                                made.push((slot, u32::MAX));
+                                return made;
+                            }
                             host.make_null(index);
                             continue;
                         };
+                        if required_cbv && (gpu == 0 || to.is_null()) {
+                            made.push((slot, u32::MAX));
+                            return made;
+                        }
                         list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
+                        if required_cbv {
+                            made.push((slot, u32::MAX));
+                            return made;
+                        }
                         host.make_at(index, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
@@ -2109,6 +2276,10 @@ impl State {
                         }
                     }
                     None => {
+                        if required_cbv {
+                            made.push((slot, u32::MAX));
+                            return made;
+                        }
                         host.make_null(index);
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
@@ -2364,6 +2535,14 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
+        // GPU-produced indirect arguments cannot be certified while recording.
+        if kind == DISPATCH && p.dispatch_contract() != DispatchContract::None {
+            if !indirect_contract_allows(true, max) {
+                why("translated shader has a dispatch contract; indirect counts are unknown");
+                return false;
+            }
+            return true;
+        }
         // Indirect rectangles (the title's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
         // number) are completed by the pipeline's geometry stage: the

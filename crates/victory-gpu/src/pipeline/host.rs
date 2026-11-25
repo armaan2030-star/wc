@@ -310,6 +310,15 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
+impl HostPipeline {
+    pub(crate) fn dispatch_contract(&self) -> victory_shader::emit::DispatchContract {
+        use victory_shader::emit::DispatchContract;
+        if !self.compute { return DispatchContract::None; }
+        self.stages.iter().map(|s| s.translated().host.dispatch_contract)
+            .find(|c| *c != DispatchContract::None).unwrap_or(DispatchContract::None)
+    }
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
