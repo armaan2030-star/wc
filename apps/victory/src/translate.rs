@@ -80,6 +80,14 @@ struct Tally {
     gs_bounded: usize,
     gs_max_vertices: u32,
     gs_stopped: usize,
+    /// ES programs (the vertex half of a merged stage): those whose resources
+    /// were traced and I/O raised, and those that write a record for the GS
+    /// half ([`victory_shader::handoff::es_record`]) with the largest record.
+    es_programs: usize,
+    es_tracked: usize,
+    es_raised: usize,
+    es_records: usize,
+    es_max_dwords: u32,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -147,6 +155,11 @@ impl Tally {
         self.gs_bounded += other.gs_bounded;
         self.gs_max_vertices = self.gs_max_vertices.max(other.gs_max_vertices);
         self.gs_stopped += other.gs_stopped;
+        self.es_programs += other.es_programs;
+        self.es_tracked += other.es_tracked;
+        self.es_raised += other.es_raised;
+        self.es_records += other.es_records;
+        self.es_max_dwords = self.es_max_dwords.max(other.es_max_dwords);
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -431,7 +444,13 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let structured = structure::structure(&program);
                 let lanes = structured.as_ref().ok();
                 let geometry = p.stage == HwStage::Gs;
+                let es = p.stage == HwStage::Es;
                 t.gs_programs += usize::from(geometry);
+                t.es_programs += usize::from(es);
+                if es && let Ok(r) = victory_shader::handoff::es_record(&program) {
+                    t.es_records += 1;
+                    t.es_max_dwords = t.es_max_dwords.max(r.dwords);
+                }
                 if geometry && let Ok(l) = victory_shader::merged::limits(&program) {
                     t.gs_bounded += 1;
                     t.gs_max_vertices = t.gs_max_vertices.max(l.max_vertices);
@@ -439,10 +458,11 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 // (the ES half each geometry program pairs with is not in
                 // its container: its user data 0 and 1 are taken as free, which
                 // the geometry line says)
-                let track = if geometry { resource::track_merged } else { resource::track };
+                let track = if geometry || es { resource::track_merged } else { resource::track };
                 let res = match track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {
                         t.gs_tracked += usize::from(geometry);
+                        t.es_tracked += usize::from(es);
                         tally_resources(&p, &r, t);
                         Some(r)
                     }
@@ -460,7 +480,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
                 let compute = p.stage == HwStage::Cs;
                 let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms || geometry {
+                if graphics || compute || p.stage == HwStage::Ms || geometry || es {
                     t.io_programs += usize::from(graphics);
                     match io::raise(&program, &p) {
                         Ok(r) => {
@@ -468,6 +488,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                                 tally_io(&r, t);
                             }
                             t.gs_raised += usize::from(geometry);
+                            t.es_raised += usize::from(es);
                             raised = Some(r);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
@@ -494,6 +515,10 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 };
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
+                    if es {
+                        // Translated with its GS half (`emit::merged_halves`), not alone.
+                        continue;
+                    }
                     if geometry {
                         // No geometry emission yet: counted on its own line,
                         // anything else it fails with is a failure.

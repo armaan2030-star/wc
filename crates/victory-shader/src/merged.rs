@@ -21,10 +21,11 @@
 //!   two layouts and refuses programs that disagree about a user-data dword.
 //!
 //! What it does not do yet: translate the stage. The ES half hands its
-//! records over through LDS, the GS half reads them from there and writes
-//! its output vertices there too, with `s_sendmsg` GS_EMIT, GS_CUT and
-//! GS_DONE; none of that is modeled. Emission refuses a geometry program with
-//! [`crate::emit::GS_EMIT`].
+//! records over through LDS and the GS half reads them from there
+//! ([`crate::handoff`] finds both); the GS half writes its output vertices
+//! to LDS too, with `s_sendmsg` GS_EMIT, GS_CUT and GS_DONE ([`limits`]
+//! counts them); the output is not modeled. Emission refuses a geometry
+//! program with [`crate::emit::GS_EMIT`].
 
 use crate::ShaderError::{self, Malformed};
 use crate::gfx10::Fields;

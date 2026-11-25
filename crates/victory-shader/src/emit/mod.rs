@@ -299,12 +299,16 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     translate_native(&c, &native, false)
 }
 
-/// Translates a geometry program with the ES program it is linked with: the
-/// pair is one merged stage ([`crate::merged`]), whose user SGPRs hold the
-/// root parameters of both. The containers are the vertex container the ES
-/// program is in and the geometry container. Until geometry emission exists
-/// this is [`GS_EMIT`] for every pair that pairs.
-pub fn translate_merged_gs(es: &[u8], gs: &[u8]) -> Result<HostShader, ShaderError> {
+/// The two halves of a merged geometry stage, from the vertex container the
+/// ES program is in and the geometry container: paired
+/// ([`crate::merged::pair_es_gs`]), the ES half traced, raised and
+/// structured as the stage runs it (with the merged layout), and the record
+/// it writes matched with the vertex reads of the GS half
+/// ([`crate::handoff::handoff`]).
+pub fn merged_halves(
+    es: &[u8],
+    gs: &[u8],
+) -> Result<(crate::merged::MergedGs, crate::handoff::Handoff), ShaderError> {
     let stage_of = |bytes: &[u8], stage| -> Result<NativeProgram, ShaderError> {
         let c = Container::parse(bytes)?;
         let dxil = c
@@ -319,6 +323,26 @@ pub fn translate_merged_gs(es: &[u8], gs: &[u8]) -> Result<HostShader, ShaderErr
             })
     };
     let merged = crate::merged::pair_es_gs(stage_of(es, HwStage::Es)?, stage_of(gs, HwStage::Gs)?)?;
+    let es_native = NativeProgram {
+        layout: merged.layout.clone(),
+        ..merged.es.clone()
+    };
+    let es_ir = crate::spill::build(&es_native)?;
+    let st = structure::structure(&es_ir);
+    resource::track_merged(&es_ir, &es_native.layout, es_native.stage, st.as_ref().ok())?;
+    io::raise(&es_ir, &es_native)?;
+    st?;
+    let gs_ir = crate::spill::build(&merged.gs)?;
+    let handoff = crate::handoff::handoff(&es_ir, &gs_ir)?;
+    Ok((merged, handoff))
+}
+
+/// Translates a geometry program with the ES program it is linked with: the
+/// pair is one merged stage ([`crate::merged`]), whose user SGPRs hold the
+/// root parameters of both ([`merged_halves`]). Until geometry emission
+/// exists this is [`GS_EMIT`] for every pair that pairs and hands over.
+pub fn translate_merged_gs(es: &[u8], gs: &[u8]) -> Result<HostShader, ShaderError> {
+    let (merged, _handoff) = merged_halves(es, gs)?;
     translate_native(&Container::parse(gs)?, &merged.program(), true)
 }
 
@@ -1822,18 +1846,43 @@ mod merged_gs_tests {
         ));
     }
 
+    /// The ES half of a pair: record of five dwords, then the handover.
+    fn es_half() -> Vec<u8> {
+        bytes(&crate::handoff::tests::es_words())
+    }
+
+    /// The GS half: reads of two vertices' records, then the load through
+    /// the runtime table.
+    fn gs_half() -> Vec<u8> {
+        let mut words = crate::handoff::tests::gs_words();
+        words.pop();
+        words.extend([0xF400_0004, 0xFA00_00B8, S_ENDPGM]);
+        bytes(&words)
+    }
+
     #[test]
     fn an_es_and_a_gs_container_pair_and_stop_at_emission() {
-        let es = container(&[(HwStage::Es, &bytes(&[S_ENDPGM])), (HwStage::Vs, &bytes(&[S_ENDPGM]))]);
-        let gs = container(&[(HwStage::Gs, &load(8))]);
+        let es = container(&[(HwStage::Es, &es_half()), (HwStage::Vs, &bytes(&[S_ENDPGM]))]);
+        let gs = container(&[(HwStage::Gs, &gs_half())]);
         assert!(stopped_at_gs_emit(translate_merged_gs(&es, &gs)));
+        let (_, h) = merged_halves(&es, &gs).unwrap();
+        assert_eq!((h.es.dwords, h.vertices), (5, 2));
+    }
+
+    #[test]
+    fn an_es_half_that_does_not_hand_over_stops_the_pair_before_the_gs_half() {
+        let es = container(&[(HwStage::Es, &bytes(&[S_ENDPGM]))]);
+        let gs = container(&[(HwStage::Gs, &gs_half())]);
+        let r = translate_merged_gs(&es, &gs);
+        assert!(matches!(r, Err(ShaderError::Unsupported { what, .. })
+            if what == "an ES half that does not hand over to the GS half"), "{r:?}");
     }
 
     #[test]
     fn containers_that_are_not_an_es_and_a_gs_do_not_pair() {
-        let es = container(&[(HwStage::Es, &bytes(&[S_ENDPGM]))]);
+        let es = container(&[(HwStage::Es, &es_half())]);
         let vs = container(&[(HwStage::Vs, &bytes(&[S_ENDPGM]))]);
-        let gs = container(&[(HwStage::Gs, &load(8))]);
+        let gs = container(&[(HwStage::Gs, &gs_half())]);
         for (a, b) in [(&gs, &gs), (&vs, &gs), (&es, &vs), (&gs, &es)] {
             let r = translate_merged_gs(a, b);
             assert!(r.is_err() && !stopped_at_gs_emit(r), "paired");
