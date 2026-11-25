@@ -169,7 +169,10 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    // the hash the runtime logs and VICTORY_SKIP_PIPELINES takes: the
+                    // first 8 bytes of the container's BLAKE3
+                    let hash = blake3::hash(&bytes).to_hex();
+                    println!("{}{} {}: {line}", path.display(), source.label(), &hash[..16]);
                     for l in &listing {
                         println!("{l}");
                     }
