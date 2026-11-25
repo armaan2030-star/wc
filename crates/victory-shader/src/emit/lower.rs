@@ -554,13 +554,22 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
         Wave::Prefix => PREFIX,
         _ => MIXED,
     };
-    // a mask (by its low dword) under which only a wave's first lane runs
+    // A first-lane predicate merely occurring in EXEC is not proof
+    // that only the first lane runs: !first and first || other also
+    // contain it. Require the positive predicate for reservations.
     let first_mask = |firsts: &HashSet<Value>, m: Option<Value>| {
         m.and_then(|m| st.masks.get(&m)).is_some_and(|&b| {
-            st.bools
-                .support(b)
-                .iter()
-                .any(|a| matches!(a, Atom::Lane(v) if firsts.contains(v)))
+            st.bools.support(b).into_iter().any(|a| {
+                matches!(a, Atom::Lane(v) if firsts.contains(&v))
+                    && st.bools.requires_atom(b, a)
+            })
+        })
+    };
+    // Retain the conservative side-effect check for any dependence on
+    // first-lane selection, even when it is not a proven reservation.
+    let depends_on_first = |firsts: &HashSet<Value>, m: Option<Value>| {
+        m.and_then(|m| st.masks.get(&m)).is_some_and(|&b| {
+            st.bools.support(b).iter().any(|a| matches!(a, Atom::Lane(v) if firsts.contains(v)))
         })
     };
     // One instruction outside a section: the kind of what it writes, and whether it is a
@@ -757,7 +766,7 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                         && !(name.starts_with("ds_read")
                             || name.starts_with("ds_swizzle")
                             || name.contains("permute"));
-                if check && effect && !reserved && first_mask(firsts, inst.read(Reg::S(EXEC))) {
+                if check && effect && !reserved && depends_on_first(firsts, inst.read(Reg::S(EXEC))) {
                     return Err((inst.machine.offset, EFFECT));
                 }
                 let guarded = st.guards[b][i].is_some();

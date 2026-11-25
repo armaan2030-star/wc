@@ -142,6 +142,42 @@ impl Bools {
         vars.into_iter().map(|v| self.atoms[v as usize]).collect()
     }
 
+    /// Does every satisfying assignment of b require atom to be true?
+    /// Walk only the false branch of that atom; all other variables are
+    /// unconstrained. A true terminal is a counterexample. Stop
+    /// conservatively on a large diagram rather than prove an unsafe split.
+    pub(crate) fn requires_atom(&self, b: Bool, atom: Atom) -> bool {
+        let Some(&target) = self.ids.get(&atom) else {
+            return false;
+        };
+        if b == Bool::FALSE {
+            return false;
+        }
+        let mut stack = vec![b];
+        let mut seen = HashSet::new();
+        while let Some(b) = stack.pop() {
+            if b == Bool::TRUE {
+                return false;
+            }
+            if b == Bool::FALSE || !seen.insert(b) {
+                continue;
+            }
+            if seen.len() > MAX_MEET {
+                return false;
+            }
+            let (v, lo, hi) = self.nodes[b.0 as usize];
+            if v > target {
+                // Ordered diagram: the atom cannot occur below this node.
+                return false;
+            }
+            stack.push(lo);
+            if v != target {
+                stack.push(hi);
+            }
+        }
+        true
+    }
+
     fn vars(&self, b: Bool) -> Vec<u32> {
         let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![b]);
         while let Some(b) = stack.pop() {
@@ -1421,6 +1457,28 @@ fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), 
 mod tests {
     use super::*;
     use crate::ir;
+
+    #[test]
+    fn first_lane_predicate_must_be_required_not_merely_present() {
+        let mut b = Bools::new();
+        let first = Atom::Lane(Value(1));
+        let other = Atom::Lane(Value(2));
+        let f = b.atom(first, 0);
+        let o = b.atom(other, 0);
+        let both = b.and(f, o);
+        let either = b.or(f, o);
+        let inverse = b.not(f);
+        let inverse_and = b.and(inverse, o);
+        assert!(b.requires_atom(f, first));
+        assert!(b.requires_atom(both, first));
+        assert!(b.requires_atom(both, other));
+        assert!(!b.requires_atom(either, first));
+        assert!(!b.requires_atom(inverse, first));
+        assert!(!b.requires_atom(inverse_and, first));
+        assert!(!b.requires_atom(o, first));
+        assert!(!b.requires_atom(Bool::TRUE, first));
+        assert!(!b.requires_atom(Bool::FALSE, first));
+    }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
