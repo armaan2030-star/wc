@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -152,6 +152,28 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+fn parse_pairs(value: &str) -> Result<Vec<(&str, &str)>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .enumerate()
+        .map(|(index, entry)| {
+            entry
+                .split_once('+')
+                .map(|(vertex, pixel)| (vertex.trim(), pixel.trim()))
+                .filter(|(vertex, pixel)| !vertex.is_empty() && !pixel.is_empty())
+                .with_context(|| {
+                    format!(
+                        "invalid VICTORY_PAIRS entry {} ({entry:?}): expected two non-empty selectors in vs+ps format",
+                        index + 1
+                    )
+                })
+        })
+        .collect()
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -159,6 +181,11 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
+    let pair_config = match std::env::var("VICTORY_PAIRS") {
+        Err(std::env::VarError::NotPresent) => String::new(),
+        value => value.context("VICTORY_PAIRS must contain valid Unicode")?,
+    };
+    let pairs = parse_pairs(&pair_config)?;
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
@@ -177,12 +204,6 @@ pub fn run(
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
-    let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|p| p.split_once('+'))
-        .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
-        .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -782,4 +803,39 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pairs;
+
+    #[test]
+    fn parses_shader_pairs() {
+        assert!(parse_pairs("").unwrap().is_empty());
+        assert_eq!(
+            parse_pairs(" vertex+pixel , mesh + pixel+variant ").unwrap(),
+            [("vertex", "pixel"), ("mesh", "pixel+variant")]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_shader_pairs() {
+        for (value, index, entry) in [
+            ("vertex", 1, "vertex"),
+            ("   ", 1, "   "),
+            ("+", 1, "+"),
+            ("+pixel", 1, "+pixel"),
+            ("vertex+   ", 1, "vertex+   "),
+            ("vertex+pixel, +other", 2, " +other"),
+            ("vertex+pixel,", 2, ""),
+            ("vertex+pixel,,other+pixel", 2, ""),
+        ] {
+            let error = parse_pairs(value).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("VICTORY_PAIRS entry {index} ({entry:?})")),
+                "{value:?}: {error}"
+            );
+            assert!(error.contains("vs+ps"), "{value:?}: {error}");
+        }
+    }
 }
