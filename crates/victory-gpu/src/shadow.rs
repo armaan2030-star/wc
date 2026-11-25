@@ -1566,14 +1566,15 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
-    let gone: Vec<Arc<Shadow>> = {
-        // Held from the look to the removal: `loose` hands a copy out
-        // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    // Asked once, and only when there are copies to look at.
+    let idle_ms = std::cell::OnceCell::new();
+    // Held from the look to the removal: `loose` and `exact` hand a copy
+    // out under the same lock, so none is handed out in between.
+    let sweep = |map: &mut BTreeMap<(u64, u64), Arc<Shadow>>| -> Vec<Arc<Shadow>> {
         if map.is_empty() {
-            return;
+            return Vec::new();
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        let idle_ms = *idle_ms.get_or_init(|| crate::host::ram_idle_ms(crate::host::available_physical_ram()));
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
@@ -1585,6 +1586,8 @@ pub(crate) fn let_go_idle() {
             .collect();
         idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
+    let mut gone = sweep(&mut LOOSE.lock().unwrap_or_else(|e| e.into_inner()));
+    gone.extend(sweep(&mut EXACT.lock().unwrap_or_else(|e| e.into_inner())));
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
         crate::host::trail(|| {
@@ -3048,6 +3051,72 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+/// Copies of exactly the title memory one buffer view reads, by (start,
+/// length): for views the copy of the memory they are in cannot show
+/// (`crate::descriptor::host`: a typed view `offset % element != 0` bytes
+/// into that copy, which no host view can begin at).
+static EXACT: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// A copy of title memory `[start, start + len)` and nothing else, made on
+/// first ask: its first byte is `start`'s, so a view of it begins at its
+/// element 0. Brought up to date like any copy by what binds it (the slot's
+/// [`crate::descriptor::host::buffer_copy`] names it); let go with the
+/// windows when nothing holds it any more ([`let_go_idle`]).
+///
+/// shortcut: a second copy of memory another copy also holds. What shaders
+/// write to that other copy reaches this one only through title memory
+/// (after the submission, as for any copy), not within the submission, and
+/// only shader views are made on it, so nothing is written through it.
+pub(crate) fn exact(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    if len == 0 {
+        return None;
+    }
+    start.checked_add(len)?;
+    let mut map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(shadow) = map.get(&(start, len)) {
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(shadow.clone());
+    }
+    let (buffer, data) = host()?.shared_buffer(len)?;
+    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} of one view"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    tracing::debug!(start = format_args!("{start:#x}"), len, "a buffer view's own host copy");
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
+    map.insert((start, len), shadow.clone());
+    Some(shadow)
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use super::{EXACT, exact};
+
+    /// A view's own copy holds exactly its bytes once brought up to date,
+    /// and the same range asked for again is the same copy.
+    #[test]
+    fn a_views_own_copy_holds_exactly_its_bytes() {
+        if crate::host::host().is_none() {
+            return; // no host device to make buffers on
+        }
+        let title: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8).collect();
+        // 3 elements of 12 bytes, 4 bytes into the memory: what a typed
+        // R32G32B32 view off its copy's elements reads.
+        let start = title.as_ptr() as u64 + 4;
+        let copy = exact(start, 36).unwrap();
+        assert_eq!(copy.span(), (start, 36));
+        assert_eq!(copy.offset(start), 0, "the view begins at the copy's first byte");
+        assert!(copy.update(start as usize, 36) > 0);
+        // SAFETY: the copy's mapped bytes, 36 of them.
+        let bytes = unsafe { std::slice::from_raw_parts(copy.data, 36) };
+        assert_eq!(bytes, &title[4..40]);
+        let again = exact(start, 36).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&copy, &again));
+        assert!(exact(start, 0).is_none());
+        drop((copy, again));
+        EXACT.lock().unwrap().remove(&(start, 36));
+    }
 }
 
 #[cfg(test)]

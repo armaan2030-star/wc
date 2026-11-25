@@ -1507,6 +1507,14 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     if len == 0 {
         return None;
     }
+    // A shader view off its copy's elements shows a copy of its own range.
+    if let Some(words) = shader_buffer_words(view)
+        && let Some((base, width)) = buffer_extent(view)
+        && let Some(shadow) = crate::shadow::find(base, width)
+        && off_element(shadow.offset(base), &srv_desc(words))
+    {
+        return crate::shadow::exact(address, len).map(|own| (own, address, len));
+    }
     if view_extent()
         && let Some((base, width)) = buffer_extent(view)
         // (The console is lax: a view may begin past its buffer's end.)
@@ -1517,6 +1525,36 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
         return Some((shadow, address, len));
     }
     crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
+}
+
+/// The description of a shader (not unordered access) view of buffer
+/// memory, as the title wrote it.
+fn shader_buffer_words(view: &View) -> Option<&[u32; 10]> {
+    match view {
+        View::Shader(r, Some(desc)) => {
+            crate::resource::buffer_bytes(*r as crate::object::This)?;
+            Some(desc)
+        }
+        View::Placed(false, resource, desc) if resource[0] == 1 => desc[..10].try_into().ok(),
+        _ => None,
+    }
+}
+
+/// Whether a shader buffer view `offset` bytes into the host copy of the
+/// memory it is in cannot be made on that copy: it is no raw window
+/// ([`raw_window`]) and does not begin on one of its elements there (a
+/// typed view's first element is counted in its elements, and the console
+/// lets a view begin anywhere: 121 `R32G32B32_FLOAT` views of 264-792
+/// bytes a run, #62). Such a view is made on a copy of its own range
+/// instead ([`crate::shadow::exact`]), where it begins at element 0; it was
+/// left null, and shaders read zeros.
+fn off_element(offset: u64, desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> bool {
+    // SAFETY: a buffer view's union member.
+    let b = unsafe { desc.Anonymous.Buffer };
+    let window = desc.Format == DXGI_FORMAT_UNKNOWN
+        && raw_window(offset, b.FirstElement, b.NumElements, b.StructureByteStride).is_some();
+    let element = element_size(desc);
+    !window && element != 0 && !offset.is_multiple_of(element)
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -1604,8 +1642,19 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
-    let offset = shadow.offset(address);
+    let mut shadow = crate::shadow::find(address, len)?;
+    let mut offset = shadow.offset(address);
+    // Off the copy's elements: on a copy of the view's own range, from its
+    // element 0 (see `off_element`; `buffer_copy` names the same copy).
+    if off_element(offset, &desc) {
+        let element = element_size(&desc);
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        let start = buffer.FirstElement.checked_mul(element)?.checked_add(address)?;
+        shadow = crate::shadow::exact(start, u64::from(buffer.NumElements) * element)?;
+        buffer.FirstElement = 0;
+        offset = 0;
+    }
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
     let structured = unsafe { desc.Anonymous.Buffer };
@@ -2311,6 +2360,90 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A typed buffer view: `count` elements of `format` from `first`.
+    fn typed_view(format: DXGI_FORMAT, first: u64, count: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+        D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: first,
+                    NumElements: count,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                },
+            },
+        }
+    }
+
+    /// Which views need a copy of their own (#62): typed and structured
+    /// ones not on an element of their copy, not raw windows, not those on
+    /// an element, not views of no known element size.
+    #[test]
+    fn views_off_their_copys_elements_are_told_apart() {
+        let rgb = typed_view(DXGI_FORMAT_R32G32B32_FLOAT, 0, 22);
+        assert!(off_element(4, &rgb), "12-byte elements 4 bytes in");
+        assert!(off_element(16, &rgb));
+        assert!(!off_element(24, &rgb), "on an element");
+        assert!(!off_element(0, &rgb));
+        assert!(!off_element(6, &typed_view(DXGI_FORMAT_R16_FLOAT, 0, 8)));
+        assert!(off_element(6, &typed_view(DXGI_FORMAT_R32_FLOAT, 0, 8)));
+        assert!(!off_element(4, &typed_view(DXGI_FORMAT_UNKNOWN, 0, 8)), "no element size");
+        let mut structured = typed_view(DXGI_FORMAT_UNKNOWN, 0, 10);
+        structured.Anonymous.Buffer.StructureByteStride = 20;
+        assert!(!off_element(32, &structured), "a raw window");
+        assert!(off_element(8, &structured), "no raw window, off its elements");
+        assert!(!off_element(40, &structured), "no raw window, on an element");
+    }
+
+    /// A typed view that begins off an element of its memory's copy is made
+    /// on a copy of its own range, at element 0, and the slot's copy is the
+    /// one `buffer_copy` names, so the heap pass brings it up to date (#62:
+    /// such views were left null and read zeros). A view on an element
+    /// still uses the buffer's copy.
+    #[test]
+    fn a_typed_view_off_its_copys_elements_gets_its_own_copy() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        const RESOURCE: usize = 0x62_0062;
+        let title = vec![0u8; 8192];
+        let start = title.as_ptr() as u64;
+        crate::shadow::register(RESOURCE, start, title.len() as u64);
+        // The title's views of memory 4 bytes into the buffer: 22 of 12
+        // bytes (264, as in #62) from element 1, then the same view's
+        // memory on an element of the buffer's copy.
+        let placed = |base: u64, desc: &D3D12_SHADER_RESOURCE_VIEW_DESC| {
+            // SAFETY: 40 bytes in the host's layout, as `srv_desc` reads them.
+            let words: [u32; 10] = unsafe { std::ptr::from_ref(desc).cast::<[u32; 10]>().read_unaligned() };
+            let mut resource = [0u32; 14];
+            resource[0] = 1; // a buffer
+            resource[4] = 1024; // its width
+            let mut view = [0u32; 16];
+            view[..10].copy_from_slice(&words);
+            view[10] = base as u32;
+            view[11] = (base >> 32) as u32;
+            View::Placed(false, resource, view)
+        };
+        let desc = typed_view(DXGI_FORMAT_R32G32B32_FLOAT, 1, 22);
+        let base = start + 4;
+        let kept = buffer_srv(base, 1024, desc, heap.cpu(0)).expect("a view, not left null");
+        let (copy, address, len) = buffer_copy(&placed(base, &desc)).unwrap();
+        assert_eq!((address, len), (base + 12, 22 * 12));
+        assert_eq!(copy.span(), (base + 12, 22 * 12), "a copy of the view's range alone");
+        assert_eq!(kept.as_ref(), Some(&copy.buffer), "the slot shows the copy the pass updates");
+
+        let kept = buffer_srv(start + 24, 1024, desc, heap.cpu(1)).expect("a view");
+        let (copy, ..) = buffer_copy(&placed(start + 24, &desc)).unwrap();
+        assert_eq!(copy.span(), (start, title.len() as u64), "the buffer's own copy");
+        assert_eq!(kept.as_ref(), Some(&copy.buffer));
+        crate::shadow::unregister(RESOURCE, start);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
