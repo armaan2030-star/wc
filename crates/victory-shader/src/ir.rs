@@ -590,31 +590,7 @@ pub(crate) fn thread_edges(
 /// waves needs for the barriers of its exchanges and LDS accesses.
 /// `None` if the program has no such branch.
 pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
-    let ends = |b: usize| {
-        p.blocks[b].exit == Exit::End
-            && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
-    };
-    let mut blocks = p.blocks.clone();
-    let mut any = false;
-    for block in &mut blocks {
-        let Exit::Branch { taken, not_taken } = block.exit else {
-            continue;
-        };
-        if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
-            block.insts.pop();
-            block.exit = Exit::Jump(not_taken);
-            any = true;
-        }
-    }
-    if !any {
-        return None;
-    }
-    for block in &mut blocks {
-        block.phis.clear();
-    }
-    link(&mut blocks);
-    split_irreducible(&mut blocks).ok()?;
-    Some(rename(blocks, p.wave64, p.vgprs))
+    without_skips_mode(p, false, true)
 }
 
 /// As [`without_early_outs`], and also without the branches that only skip a
@@ -637,10 +613,14 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 /// That leaves out most of the skips of the title's large lighting programs, whose bodies
 /// are then code every lane runs.
 pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
+    without_skips_mode(p, deep, false)
+}
+
+fn without_skips_mode(p: &Program, deep: bool, early_only: bool) -> Option<Program> {
     let n = p.blocks.len();
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
-            && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
+            && p.blocks[b].insts.iter().all(|i| matches!(i.name(), "s_endpgm" | "s_nop"))
     };
     // Scalars moved from register to register (a scalar the compiler parked in a VGPR lane
     // comes back by such a move, `unspill`) are the value they copy.
@@ -670,14 +650,44 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             }
         }
     }
+    // The IR reads the previous VGPR to preserve lanes outside EXEC. A
+    // full-wave conditional select or cross-row permutation writes every lane;
+    // the latter can select only a lane in the neighboring 16-lane row.
+    let mut full_exec = std::collections::HashSet::new();
+    for i in p.blocks.iter().flat_map(|b| &b.insts) {
+        if p.wave64 && i.name() == "s_or_saveexec_b64"
+            && matches!(&i.fields, Fields::Sop { dst: Some(Operand::Scalar {code, ..}), src, .. }
+                if !matches!(code, 125..=127) && src.as_slice() == [Operand::Const(193)])
+        {
+            full_exec.extend([EXEC, EXEC + 1].into_iter().filter_map(|r| i.write(Reg::S(r))));
+        }
+    }
+    let overwritten = |i: &Inst| -> Option<Reg> {
+        if !matches!(i.name(), "v_cndmask_b32" | "v_permlanex16_b32")
+            || ![EXEC, EXEC + 1].into_iter().all(|r| i.read(Reg::S(r)).is_some_and(|v| full_exec.contains(&v)))
+        {
+            return None;
+        }
+        let Fields::Valu(v) = &i.fields else { return None };
+        let Some(Operand::Vector { reg, dwords: 1 }) = v.dst else { return None };
+        if v.dpp.is_some() || v.sdwa.is_some() || v.opsel != 0 || v.opsel_hi != 0 {
+            return None;
+        }
+        let reads_dst = v.src.iter().any(|op| matches!(op, Operand::Vector { reg: start, dwords }
+            if reg.checked_sub(*start).is_some_and(|offset| u32::from(offset) < u32::from(*dwords))));
+        (!reads_dst).then_some(Reg::V(reg))
+    };
     let mut changed = true;
     while changed {
         changed = false;
         for block in &p.blocks {
             for inst in &block.insts {
                 if !idle(inst, &live) {
+                    let overwritten = overwritten(inst);
                     for r in &inst.reads {
-                        changed |= live.insert(r.1);
+                        if Some(r.0) != overwritten {
+                            changed |= live.insert(r.1);
+                        }
                     }
                 }
             }
@@ -696,6 +706,124 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         }
         v
     };
+    let op_nonzero = |inst: &Inst, op: &Operand, d: u8, nonzero: &std::collections::HashSet<Value>| {
+        match *op {
+            Operand::Scalar { code: gfx10::NULL, .. }
+            | Operand::Const(128)
+            | Operand::Literal(0) => false,
+            Operand::Scalar { code, dwords } => {
+                let reg = Reg::S(code + if dwords > 1 { d } else { 0 });
+                inst.read(reg).is_none_or(|v| nonzero.contains(&v))
+            }
+            _ => true,
+        }
+    };
+    let scalar_side_effect = |inst: &Inst| -> bool {
+        let name = inst.name();
+        match &inst.fields {
+            Fields::Smem { .. } => name.contains("_store_") || name.contains("_atomic_"),
+            Fields::Sopp { .. } => matches!(
+                name,
+                "s_sendmsg" | "s_sendmsghalt" | "s_barrier" | "s_round_mode" | "s_denorm_mode"
+            ),
+            _ => false,
+        }
+    };
+    let section_side_effect = |inst: &Inst| -> bool {
+        let name = inst.name();
+        match &inst.fields {
+            Fields::Exp { .. } => true,
+            Fields::Ds { .. } => {
+                !(name.starts_with("ds_read")
+                    || name.starts_with("ds_swizzle")
+                    || name.contains("permute"))
+            }
+            Fields::Buffer { lds, .. } | Fields::Flat { lds, .. } => {
+                *lds || name.contains("store") || name.contains("atomic")
+            }
+            Fields::Image { .. } | Fields::Smem { .. } => {
+                name.contains("store") || name.contains("atomic")
+            }
+            Fields::Sopp { .. } => matches!(
+                name,
+                "s_barrier"
+                    | "s_sendmsg"
+                    | "s_sendmsghalt"
+                    | "s_wakeup"
+                    | "s_round_mode"
+                    | "s_denorm_mode"
+                    | "s_endpgm"
+                    | "s_endpgm_saved"
+                    | "s_endpgm_ordered_ps_done"
+                    | "s_code_end"
+            ),
+            Fields::Sop { .. } => {
+                name.starts_with("s_setpc")
+                    || name.starts_with("s_swappc")
+                    || name.starts_with("s_call")
+                    || name.starts_with("s_rfe")
+            }
+            Fields::Valu(_) | Fields::Vintrp { .. } => false,
+        }
+    };
+    let restore_name = if p.wave64 { "s_mov_b64" } else { "s_mov_b32" };
+    // Pure whole-wave sections inside a block: (start -> end, saved register code).
+    let pure_sections = |x: usize| -> std::collections::HashMap<usize, (usize, u8)> {
+        let insts = &p.blocks[x].insts;
+        let mut out = std::collections::HashMap::new();
+        let mut i = 0;
+        while i < insts.len() {
+            let inst = &insts[i];
+            let all = match (p.wave64, inst.name()) {
+                (true, "s_or_saveexec_b64") | (false, "s_or_saveexec_b32") => {
+                    Some(Operand::Const(193))
+                }
+                (true, "s_nand_saveexec_b64") | (false, "s_nand_saveexec_b32") => {
+                    Some(Operand::Const(128))
+                }
+                _ => None,
+            };
+            let saved = match &inst.fields {
+                Fields::Sop {
+                    dst: Some(Operand::Scalar { code, .. }),
+                    src,
+                    ..
+                } if all.is_some_and(|k| src.first() == Some(&k)) => {
+                    inst.write(Reg::S(*code)).and_then(|lo| {
+                        if p.wave64 {
+                            inst.write(Reg::S(*code + 1)).map(|hi| (*code, lo, Some(hi)))
+                        } else {
+                            Some((*code, lo, None))
+                        }
+                    })
+                }
+                _ => None,
+            };
+            let Some((code, lo, hi)) = saved else {
+                i += 1;
+                continue;
+            };
+            let end = (i + 1..insts.len()).find(|&j| {
+                let c = &insts[j];
+                c.name() == restore_name
+                    && c.write(Reg::S(EXEC)).is_some()
+                    && (!p.wave64 || c.write(Reg::S(EXEC + 1)).is_some())
+                    && c.read(Reg::S(code)) == Some(lo)
+                    && hi.is_none_or(|h| c.read(Reg::S(code + 1)) == Some(h))
+            });
+            let Some(end) = end else {
+                i += 1;
+                continue;
+            };
+            if insts[i + 1..end].iter().any(section_side_effect) {
+                i += 1;
+                continue;
+            }
+            out.insert(i, (end, code));
+            i = end + 1;
+        }
+        out
+    };
     // The region a skip of `b` to `target` leaves out, if it is a pure skip.
     let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
         let mut inside = vec![false; n];
@@ -709,6 +837,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             }
             inside[x] = true;
             match p.blocks[x].exit {
+                Exit::End if ends(target) => {}
                 Exit::End | Exit::Indirect => return None,
                 exit => stack.extend(exit.successors()),
             }
@@ -719,16 +848,297 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                 return None;
             }
         }
-        // the join sees no scalar the region changed
+        // No EXEC-independent scalar side effects inside the skipped region,
+        // and EXEC must stay 0 throughout when entered with EXEC == 0 (except
+        // inside a pure whole-wave section whose restore returns EXEC to 0).
+        let branch = p.blocks[b].insts.last()?;
+        let entry_exec = [branch.read(Reg::S(EXEC)), branch.read(Reg::S(EXEC + 1))];
+        let mut inside_defs = std::collections::HashSet::new();
+        let mut block_sections = vec![std::collections::HashMap::new(); n];
+        let mut section_vgpr_writes = std::collections::HashSet::new();
+        for x in (0..n).filter(|&x| inside[x]) {
+            for phi in &p.blocks[x].phis {
+                inside_defs.insert(phi.value);
+            }
+            let secs = pure_sections(x);
+            let mut i = 0;
+            while i < p.blocks[x].insts.len() {
+                let inst = &p.blocks[x].insts[i];
+                for &(_, w) in &inst.writes {
+                    inside_defs.insert(w);
+                }
+                if let Some(&(end, _)) = secs.get(&i) {
+                    for j in i + 1..end {
+                        for &(r, w) in &p.blocks[x].insts[j].writes {
+                            inside_defs.insert(w);
+                            if matches!(r, Reg::V(_)) {
+                                section_vgpr_writes.insert(w);
+                            }
+                        }
+                    }
+                    for &(_, w) in &p.blocks[x].insts[end].writes {
+                        inside_defs.insert(w);
+                    }
+                    i = end + 1;
+                    continue;
+                }
+                if scalar_side_effect(inst) {
+                    return None;
+                }
+                i += 1;
+            }
+            block_sections[x] = secs;
+        }
+        // Least fixpoint of values that may be nonzero when EXEC enters `inside` as 0.
+        // External values are conservatively nonzero except the branch's own EXEC dwords.
+        let mut nonzero: std::collections::HashSet<Value> = std::collections::HashSet::new();
+        let mark_external = |v: Value, nz: &mut std::collections::HashSet<Value>| {
+            if !inside_defs.contains(&v) && !entry_exec.contains(&Some(v)) {
+                nz.insert(v);
+            }
+        };
+        for x in (0..n).filter(|&x| inside[x]) {
+            for phi in &p.blocks[x].phis {
+                for &a in &phi.args {
+                    mark_external(a, &mut nonzero);
+                }
+            }
+            for inst in &p.blocks[x].insts {
+                for &(_, v) in &inst.reads {
+                    mark_external(v, &mut nonzero);
+                }
+            }
+        }
+        let mut nz_changed = true;
+        while nz_changed {
+            nz_changed = false;
+            for x in (0..n).filter(|&x| inside[x]) {
+                for phi in &p.blocks[x].phis {
+                    if phi.args.iter().any(|a| nonzero.contains(a)) {
+                        nz_changed |= nonzero.insert(phi.value);
+                    }
+                }
+                let secs = &block_sections[x];
+                let insts = &p.blocks[x].insts;
+                let mut i = 0;
+                while i < insts.len() {
+                    let inst = &insts[i];
+                    if let Some(&(end, code)) = secs.get(&i) {
+                        // Whole-wave section: saved scalar gets incoming EXEC; restore sets EXEC from saved.
+                        for (d, exec_r) in [Reg::S(EXEC), Reg::S(EXEC + 1)].into_iter().enumerate() {
+                            if let (Some(e_in), Some(sv)) =
+                                (inst.read(exec_r), inst.write(Reg::S(code + d as u8)))
+                                && nonzero.contains(&e_in)
+                            {
+                                nz_changed |= nonzero.insert(sv);
+                            }
+                        }
+                        for j in i + 1..end {
+                            for &(_, w) in &insts[j].writes {
+                                nz_changed |= nonzero.insert(w);
+                            }
+                        }
+                        let rest = &insts[end];
+                        for (d, exec_r) in [Reg::S(EXEC), Reg::S(EXEC + 1)].into_iter().enumerate() {
+                            if let Some(e_out) = rest.write(exec_r)
+                                && rest
+                                    .read(Reg::S(code + d as u8))
+                                    .is_none_or(|sv| nonzero.contains(&sv))
+                            {
+                                nz_changed |= nonzero.insert(e_out);
+                            }
+                        }
+                        i = end + 1;
+                        continue;
+                    }
+                    let name = inst.name();
+                    let exec_in_nz = [
+                        inst.read(Reg::S(EXEC))
+                            .is_none_or(|v| nonzero.contains(&v)),
+                        inst.read(Reg::S(EXEC + 1))
+                            .is_none_or(|v| nonzero.contains(&v)),
+                    ];
+                    match &inst.fields {
+                        Fields::Valu(_) if name.starts_with("v_cmpx") => {
+                            for (d, r) in [Reg::S(EXEC), Reg::S(EXEC + 1)].into_iter().enumerate() {
+                                if let Some(w) = inst.write(r)
+                                    && exec_in_nz[d]
+                                {
+                                    nz_changed |= nonzero.insert(w);
+                                }
+                            }
+                        }
+                        Fields::Sop { dst, src, .. }
+                            if matches!(
+                                name,
+                                "s_and_saveexec_b32"
+                                    | "s_and_saveexec_b64"
+                                    | "s_andn2_saveexec_b32"
+                                    | "s_andn2_saveexec_b64"
+                                    | "s_and_wrexec_b32"
+                                    | "s_and_wrexec_b64"
+                                    | "s_andn2_wrexec_b32"
+                                    | "s_andn2_wrexec_b64"
+                            ) =>
+                        {
+                            let dst_code = match dst {
+                                Some(Operand::Scalar { code, .. }) => Some(*code),
+                                _ => None,
+                            };
+                            for &(r, w) in &inst.writes {
+                                let is_nz = if r == Reg::S(EXEC) {
+                                    exec_in_nz[0]
+                                } else if r == Reg::S(EXEC + 1) {
+                                    exec_in_nz[1]
+                                } else if dst_code.is_some_and(|c| r == Reg::S(c)) {
+                                    exec_in_nz[0]
+                                } else if dst_code.is_some_and(|c| r == Reg::S(c + 1)) {
+                                    exec_in_nz[1]
+                                } else {
+                                    true
+                                };
+                                if is_nz {
+                                    nz_changed |= nonzero.insert(w);
+                                }
+                            }
+                            let _ = src;
+                        }
+                        Fields::Sop {
+                            dst: Some(Operand::Scalar { code, .. }),
+                            src,
+                            ..
+                        } if matches!(
+                            name,
+                            "s_mov_b32"
+                                | "s_mov_b64"
+                                | "s_and_b32"
+                                | "s_and_b64"
+                                | "s_andn2_b32"
+                                | "s_andn2_b64"
+                        ) =>
+                        {
+                            for &(r, w) in &inst.writes {
+                                let lane_d = if r == Reg::S(*code) {
+                                    Some(0u8)
+                                } else if r == Reg::S(*code + 1) {
+                                    Some(1u8)
+                                } else {
+                                    None
+                                };
+                                let is_nz = match (lane_d, name, &src[..]) {
+                                    (Some(d), "s_mov_b32" | "s_mov_b64", [s0]) => {
+                                        op_nonzero(inst, s0, d, &nonzero)
+                                    }
+                                    (Some(d), "s_and_b32" | "s_and_b64", [s0, s1]) => {
+                                        op_nonzero(inst, s0, d, &nonzero)
+                                            && op_nonzero(inst, s1, d, &nonzero)
+                                    }
+                                    (Some(d), "s_andn2_b32" | "s_andn2_b64", [s0, _]) => {
+                                        op_nonzero(inst, s0, d, &nonzero)
+                                    }
+                                    _ => true,
+                                };
+                                if is_nz {
+                                    nz_changed |= nonzero.insert(w);
+                                }
+                            }
+                        }
+                        _ => {
+                            for &(_, w) in &inst.writes {
+                                nz_changed |= nonzero.insert(w);
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+        // Reject if EXEC can become nonzero anywhere outside a pure whole-wave section.
+        for x in (0..n).filter(|&x| inside[x]) {
+            for phi in &p.blocks[x].phis {
+                if matches!(phi.reg, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                    && nonzero.contains(&phi.value)
+                {
+                    return None;
+                }
+            }
+            let secs = &block_sections[x];
+            let insts = &p.blocks[x].insts;
+            let mut i = 0;
+            while i < insts.len() {
+                if let Some(&(end, _)) = secs.get(&i) {
+                    for &(r, w) in &insts[end].writes {
+                        if matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                            && nonzero.contains(&w)
+                        {
+                            return None;
+                        }
+                    }
+                    i = end + 1;
+                    continue;
+                }
+                for &(r, w) in &insts[i].writes {
+                    if matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1) && nonzero.contains(&w) {
+                        return None;
+                    }
+                }
+                i += 1;
+            }
+        }
+        // A masked write after EXEC is restored still carries the old
+        // destination through its inactive lanes. Follow that dependency and
+        // intervening phis before checking which values the join observes.
+        if !section_vgpr_writes.is_empty() {
+            loop {
+                let mut changed = false;
+                for (_, block) in p.blocks.iter().enumerate().filter(|(x, _)| inside[*x]) {
+                    for phi in &block.phis {
+                        if matches!(phi.reg, Reg::V(_)) && phi.args.iter().any(|a| section_vgpr_writes.contains(a)) {
+                            changed |= section_vgpr_writes.insert(phi.value);
+                        }
+                    }
+                    for i in &block.insts {
+                        for &(r, w) in &i.writes {
+                            if matches!(r, Reg::V(_)) && i.read(r).is_some_and(|a| section_vgpr_writes.contains(&a)) {
+                                changed |= section_vgpr_writes.insert(w);
+                            }
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        // the join sees no scalar (or non-zero EXEC, or whole-wave-clobbered VGPR) the region changed
         let join = &p.blocks[target];
         for phi in &join.phis {
-            let scalar = match phi.reg {
-                Reg::S(c) => c != 126 && c != 127,
-                Reg::Scc => true,
-                Reg::V(_) => false,
-            };
+            if matches!(phi.reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
+                if (!deep || live.contains(&phi.value))
+                    && join
+                        .preds
+                        .iter()
+                        .zip(&phi.args)
+                        .any(|(q, a)| inside[*q] && nonzero.contains(a))
+                {
+                    return None;
+                }
+                continue;
+            }
+            if matches!(phi.reg, Reg::V(_)) {
+                if (!deep || live.contains(&phi.value))
+                    && join
+                    .preds
+                    .iter()
+                    .zip(&phi.args)
+                    .any(|(q, a)| inside[*q] && section_vgpr_writes.contains(a))
+                {
+                    return None;
+                }
+                continue;
+            }
             // (a join nothing reads shows no one the difference)
-            if !scalar || deep && !live.contains(&phi.value) {
+            if deep && !live.contains(&phi.value) {
                 continue;
             }
             let before: Vec<Value> =
@@ -741,7 +1151,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         // Other ways into the join than the branch and the region (an inner branch that ends
         // together with an outer one) change nothing in that: the lanes that would have
         // skipped arrive from the region instead, with the same scalars.
-        if !deep && join.preds.iter().any(|&q| q != b && !inside[q]) {
+        if !deep && !ends(target) && join.preds.iter().any(|&q| q != b && !inside[q]) {
             return None;
         }
         Some(inside)
@@ -755,7 +1165,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
             continue;
         }
-        if ends(taken) || skipped(b, taken, not_taken).is_some() {
+        if (!early_only || ends(taken)) && skipped(b, taken, not_taken).is_some() {
             blocks[b].insts.pop();
             blocks[b].exit = Exit::Jump(not_taken);
             any = true;
@@ -1605,6 +2015,110 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+    }
+
+    #[test]
+    fn a_skip_is_kept_when_body_resurrects_exec_or_has_scalar_side_effects() {
+        // Restoring an outer saved EXEC inside the skipped body resurrects skipped lanes.
+        let restore_outer = skip(&[0xBEFE_040C, 0x7E02_0285], &[]); // s_mov_b64 exec, s[12:13]; v_mov_b32 v1, 5
+        assert!(without_skips(&restore_outer, false).is_none());
+        assert!(without_skips(&restore_outer, true).is_none());
+
+        // Widening EXEC via s_or_b64 or s_andn2_b64 with non-zero src0 resurrects lanes.
+        let or_exec = skip(&[0x88FE_0C7E, 0x7E02_0285], &[]); // s_or_b64 exec, exec, s[12:13]; v_mov_b32 v1, 5
+        assert!(without_skips(&or_exec, false).is_none());
+        assert!(without_skips(&or_exec, true).is_none());
+
+        let andn2_swapped = skip(&[0x8AFE_7E0C, 0x7E02_0285], &[]); // s_andn2_b64 exec, s[12:13], exec
+        assert!(without_skips(&andn2_swapped, false).is_none());
+        assert!(without_skips(&andn2_swapped, true).is_none());
+
+        // Narrowing EXEC and restoring the inner saved mask keeps EXEC == 0: skip may be dropped.
+        let inner_narrow = skip(
+            &[
+                0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+                0x7E02_0285, // v_mov_b32 v1, 5
+                0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+            ],
+            &[],
+        );
+        assert_eq!(skips(&without_skips(&inner_narrow, false).expect("left out")), 0);
+
+        // EXEC-independent scalar side effects (s_sendmsg, s_barrier, s_buffer_store_dword)
+        // must keep the skip.
+        let with_sendmsg = skip(&[0xBF90_0001], &[]); // s_sendmsg 1
+        assert!(without_skips(&with_sendmsg, false).is_none());
+        assert!(without_skips(&with_sendmsg, true).is_none());
+
+        let with_barrier = skip(&[0xBF8A_0000], &[]); // s_barrier
+        assert!(without_skips(&with_barrier, false).is_none());
+        assert!(without_skips(&with_barrier, true).is_none());
+
+        let with_sstore = skip(&[0xF460_0180, 0xFA00_0000], &[]); // s_buffer_store_dword s6, s[0:3], 0
+        assert!(
+            with_sstore
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "s_buffer_store_dword")
+        );
+        assert!(without_skips(&with_sstore, false).is_none());
+        assert!(without_skips(&with_sstore, true).is_none());
+    }
+
+    #[test]
+    fn a_whole_wave_overwrite_consumes_only_its_explicit_vector_inputs() {
+        const ALL: u32 = 0xBE90_25C1; // s_or_saveexec_b64 s[16:17], -1
+        const RESTORE: u32 = 0xBEFE_0410; // s_mov_b64 exec, s[16:17]
+        const SET: u32 = 0x7E04_0281; // v_mov_b32 v2, 1
+        const SELECT: u32 = 0x0204_0680; // v_cndmask_b32 v2, 0, v3, vcc
+        const SELECT_OLD: u32 = 0x0204_0480; // v_cndmask_b32 v2, 0, v2, vcc
+        const STORE: [u32; 2] = [0xD834_0000, 0x0000_0200]; // ds_write_b32 v0, v2
+        let body = [ALL, SET, RESTORE];
+        let branch = |after: &[u32]| {
+            let mut after = after.to_vec();
+            after.extend(STORE);
+            let p = skip(&body, &after);
+            without_skips(&p, true).map_or(skips(&p), |q| skips(&q))
+        };
+        assert_eq!(branch(&[ALL, SELECT, RESTORE]), 0);
+        assert_eq!(branch(&[ALL, SELECT_OLD, RESTORE]), 1);
+        assert_eq!(branch(&[SELECT]), 1);
+        // Every source lane selected from the other 16-lane row is active.
+        let permuted = [0xD778_0002, 0x0201_0101]; // v_permlanex16_b32 v2, v1, 0, 0
+        assert_eq!(branch(&[ALL, permuted[0], permuted[1], RESTORE]), 0);
+        assert_eq!(branch(&permuted), 1);
+        // On an empty mask the second move preserves the value the full-wave
+        // region wrote. Restoring EXEC at the join then exposes it to the store.
+        let end = skip(&[ALL, SET, RESTORE, SET], &STORE);
+        assert!(without_skips(&end, true).is_none());
+    }
+
+    #[test]
+    fn an_empty_exec_skip_keeps_a_store_behind_a_mask_restore() {
+        // A comparison rejected all lanes, so the console skips the store. If
+        // the branch disappears, restoring the saved incoming EXEC runs it.
+        const RESTORE: u32 = 0xBEFE_040C; // s_mov_b64 exec, s[12:13]
+        const STORE: [u32; 2] = [0xD834_0000, 0x0000_0C00]; // ds_write_b32 v0, v12
+        let kept = skip(&[RESTORE, STORE[0], STORE[1]], &[]);
+        assert!(without_skips(&kept, false).is_none());
+        assert!(without_skips(&kept, true).is_none());
+        let early = build_words(
+            &[0x7D88_0000, 0xBE8C_246A, 0xBF88_0003, RESTORE, STORE[0], STORE[1], S_ENDPGM],
+            true,
+        );
+        assert!(without_early_outs(&early).is_none());
+        assert!(without_skips(&early, true).is_none());
+        // With no restore the store stays masked and the branch can go.
+        assert_eq!(skips(&without_skips(&skip(&STORE, &[]), true).unwrap()), 0);
+        // A nested save of the already-empty EXEC, restored from precisely
+        // that definition before the store, cannot enable any lanes.
+        let nested = skip(&[0xBE90_246A, 0xBEFE_0410, STORE[0], STORE[1]], &[]);
+        assert_eq!(skips(&without_skips(&nested, true).unwrap()), 0);
+        // OR-save also activates lanes if its operand was saved before
+        // the skip, even though it saves the (empty) current EXEC.
+        let activates = skip(&[0xBE90_250C, STORE[0], STORE[1]], &[]);
+        assert!(without_skips(&activates, true).is_none());
     }
 
     #[test]
