@@ -188,6 +188,19 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// The host GPU's maximum wave size, as the device creation set it (`0`
+/// before a device exists). A wave64 program lowers differently for a host
+/// of 32-lane waves than for one of 64, and a run picks the shape it serves
+/// from the device it runs on: a translation made on an AMD GPU (64 lanes)
+/// is not what an NVIDIA GPU (32 lanes) needs.
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+#[must_use]
+pub fn host_max_wave() -> u32 {
+    lower::host_max_wave()
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {

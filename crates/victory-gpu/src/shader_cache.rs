@@ -37,6 +37,46 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// What a translation depends on, over our executable file: the loop limit
+/// (which a diagnostics build can change at run time), the view heap's null
+/// slot (which differs by host GPU), which group barriers wait, the
+/// switches that pick the form of a wave64 program (without them here a run
+/// with `VICTORY_WAVE_WIDE=0` was served the translations an earlier run of
+/// the same executable had cached with the switch unset), the clean-up
+/// passes, and the host GPU's maximum wave size: a wave64 program lowers
+/// differently for a host of 32-lane waves than for one of 64, and the
+/// device a run builds on picks the shape, so a cache built on an AMD GPU
+/// (64 lanes) must not serve an NVIDIA GPU (32 lanes) its wave64
+/// translations (`0`: no device yet, the lowering's own default). Pure, for
+/// testing.
+fn key_bytes(exe: &[u8], limit: u32, heap_limit: u32) -> Vec<u8> {
+    let mut bytes = exe.to_vec();
+    bytes.extend_from_slice(&limit.to_le_bytes());
+    bytes.extend_from_slice(&heap_limit.to_le_bytes());
+    // Which group barriers wait is part of the translation too.
+    bytes.push(victory_shader::emit::group_sync());
+    for name in [
+        "VICTORY_WAVE_WIDE",
+        "VICTORY_WAVE_DEEP_SKIPS",
+        "VICTORY_WAVE_OWN_BITS",
+        "VICTORY_F16_NEAREST",
+    ] {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(b'=');
+        if let Some(value) = std::env::var_os(name) {
+            bytes.extend_from_slice(value.as_encoded_bytes());
+        }
+        bytes.push(0);
+    }
+    // And which clean-up passes ran over the translated code.
+    bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+    // And the host GPU's maximum wave size (issue 1844).
+    bytes.extend_from_slice(b"HOST_MAX_WAVE=");
+    bytes.extend_from_slice(&victory_shader::emit::host_max_wave().to_le_bytes());
+    bytes.push(0);
+    bytes
+}
+
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
 /// diagnostics build can change at run time).
@@ -52,34 +92,17 @@ fn build() -> &'static [u8; 32] {
             );
         }
         match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
+            Ok(exe) => {
                 // So is the view heap's null slot (it differs by host GPU):
-                // a translation cached without the clamp must not be served.
+                // the probe reads the device, a translation cached without
+                // the clamp must not be served.
                 crate::descriptor::host::probe_view_limit();
-                bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
-                }
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
+                *blake3::hash(&key_bytes(
+                    &exe,
+                    limit,
+                    victory_shader::emit::view_heap_limit(),
+                ))
+                .as_bytes()
             }
             Err(e) => {
                 // Without it no entry can be trusted: a fresh key per run.
@@ -332,6 +355,42 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The key covers the host GPU's maximum wave size: a wave64 program
+    /// lowers differently for a host of 32-lane waves than for one of 64
+    /// (issue 1844). Pure inputs, no device, so this runs anywhere.
+    #[test]
+    fn the_key_covers_the_host_max_wave() {
+        let exe = b"our executable";
+        assert_eq!(
+            key_bytes(exe, 1 << 20, 1 << 21),
+            key_bytes(exe, 1 << 20, 1 << 21),
+            "the same settings make one key"
+        );
+        assert_ne!(
+            key_bytes(exe, 1 << 20, 1 << 21),
+            key_bytes(exe, (1 << 20) - 1, 1 << 21),
+            "the loop limit is in the key"
+        );
+        assert_ne!(
+            key_bytes(exe, 1 << 20, 1 << 21),
+            key_bytes(exe, 1 << 20, 1 << 16),
+            "the view heap's null slot is in the key"
+        );
+        // The host max wave is part of the bytes: with two devices of
+        // different wave sizes, the same settings make two keys.
+        let with = |lanes: u32| {
+            victory_shader::emit::set_host_max_wave(lanes);
+            blake3::hash(&key_bytes(exe, 1 << 20, 1 << 21)).as_bytes().to_vec()
+        };
+        let (nvidia, amd) = (with(32), with(64));
+        assert_ne!(nvidia, amd, "the host max wave is in the key");
+        assert_ne!(
+            nvidia,
+            with(0),
+            "no device yet makes its own key, not a 64-lane one"
+        );
+    }
 
     fn shader() -> HostShader {
         HostShader {
