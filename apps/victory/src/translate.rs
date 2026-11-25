@@ -7,8 +7,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use victory_shader::emit;
+// The validator (dxil.dll) and a D3D12 host to try the emitted shaders on:
+// both exist only on Windows, so `--validate` and `--pipelines` refuse
+// everywhere else (below).
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -148,7 +154,9 @@ struct Checks {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
+    #[cfg(windows)]
     validator: Option<Validator>,
+    #[cfg(windows)]
     host: Option<(Host, emit::HostShader)>,
 }
 
@@ -165,7 +173,9 @@ pub fn run(
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
         victory_shader::emit::set_host_max_wave(n);
     }
+    #[cfg(windows)] // dxil.dll, which only Windows has
     let dll = validate.then(Validator::default_path).flatten();
+    #[cfg(windows)]
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
         println!(
@@ -174,8 +184,20 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
+    #[cfg(windows)] // a D3D12 host to try the shaders on
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::ensure!(
+            !validate,
+            "--validate needs dxil.dll, which exists only on Windows"
+        );
+        anyhow::ensure!(
+            !pipelines,
+            "--pipelines need a D3D12 host, which exists only on Windows"
+        );
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -208,6 +230,7 @@ pub fn run(
                             list,
                             ..Tally::default()
                         };
+                        #[cfg(windows)]
                         let mut checks = Checks {
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
                             validator: validate
@@ -216,6 +239,10 @@ pub fn run(
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
+                        };
+                        #[cfg(not(windows))]
+                        let mut checks = Checks {
+                            keep: (!pairs.is_empty()).then(|| kept.clone()),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -275,6 +302,9 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    // The pairs end in host pipelines (`--pipelines` above): Windows-only,
+    // so off Windows the named shaders are kept but none are built.
+    #[cfg(windows)]
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -527,7 +557,10 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     let _ = lock(out).write_all(line.as_bytes());
 }
 
-/// Validates an emitted shader if asked to.
+/// Validates an emitted shader if asked to. The validator and the host
+/// pipelines are Windows-only; elsewhere only what is kept and dumped
+/// above happens.
+#[cfg_attr(not(windows), allow(unused_mut))] // the validator below mutates it on Windows
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
@@ -550,6 +583,7 @@ fn check(
             &shader.dxil,
         );
     }
+    #[cfg(windows)]
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
@@ -567,41 +601,44 @@ fn check(
             Err(e) => t.fail(format!("pipeline: {e}"), &label),
         }
     }
-    let Some(v) = checks.validator.as_mut() else {
-        return;
-    };
-    match v.validate(&mut shader.dxil) {
-        Ok(()) => {
-            *counter(t, shader.stage, 2) += 1;
-            if t.list {
-                t.lines.push(format!("{}  validated", label()));
-            }
-        }
-        Err(text) => {
-            let first = text
-                .lines()
-                .find(|l| l.contains("error"))
-                .unwrap_or(text.lines().next().unwrap_or(""))
-                .to_owned();
-            if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
-                let n = t
-                    .failed
-                    .get(&format!("validator: {first}"))
-                    .map_or(0, |f| f.0);
-                if n < 3 {
-                    let name = format!(
-                        "{dir}/{}_{n}",
-                        first
-                            .chars()
-                            .filter(char::is_ascii_alphanumeric)
-                            .take(40)
-                            .collect::<String>()
-                    );
-                    let _ = std::fs::write(format!("{name}.dxil"), &shader.dxil);
-                    let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
+    #[cfg(windows)]
+    {
+        let Some(v) = checks.validator.as_mut() else {
+            return;
+        };
+        match v.validate(&mut shader.dxil) {
+            Ok(()) => {
+                *counter(t, shader.stage, 2) += 1;
+                if t.list {
+                    t.lines.push(format!("{}  validated", label()));
                 }
             }
-            t.fail(format!("validator: {first}"), label);
+            Err(text) => {
+                let first = text
+                    .lines()
+                    .find(|l| l.contains("error"))
+                    .unwrap_or(text.lines().next().unwrap_or(""))
+                    .to_owned();
+                if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
+                    let n = t
+                        .failed
+                        .get(&format!("validator: {first}"))
+                        .map_or(0, |f| f.0);
+                    if n < 3 {
+                        let name = format!(
+                            "{dir}/{}_{n}",
+                            first
+                                .chars()
+                                .filter(char::is_ascii_alphanumeric)
+                                .take(40)
+                                .collect::<String>()
+                        );
+                        let _ = std::fs::write(format!("{name}.dxil"), &shader.dxil);
+                        let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
+                    }
+                }
+                t.fail(format!("validator: {first}"), label);
+            }
         }
     }
 }
