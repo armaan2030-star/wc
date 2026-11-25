@@ -331,7 +331,8 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             let first = native.stage.user_sgpr(crate::merged::RUNTIME_TABLE);
             let taken = native.layout.iter().any(|p| {
                 let at = u32::from(native.stage.user_sgpr(p.user_data));
-                at < u32::from(first) + 2 && u32::from(first) < at + p.sgprs
+                // (the count is read from the container: no overflow)
+                at < u32::from(first) + 2 && u32::from(first) < at.saturating_add(p.sgprs)
             });
             let loaded = (0..2u8)
                 .filter(|_| !taken)

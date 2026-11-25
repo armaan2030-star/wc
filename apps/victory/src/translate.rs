@@ -448,9 +448,18 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let es = p.stage == HwStage::Es;
                 t.gs_programs += usize::from(geometry);
                 t.es_programs += usize::from(es);
-                if es && let Ok(r) = victory_shader::handoff::es_record(&program) {
-                    t.es_records += 1;
-                    t.es_max_dwords = t.es_max_dwords.max(r.dwords);
+                if es {
+                    match victory_shader::handoff::es_record(&program) {
+                        Ok(r) => {
+                            t.es_records += 1;
+                            t.es_max_dwords = t.es_max_dwords.max(r.dwords);
+                        }
+                        // (an ES half is not emitted alone: this is where it fails)
+                        Err(ShaderError::Unsupported { what, .. }) => {
+                            t.fail(format!("ES record: {what}"), || format!("{} {:?}", example(), p.stage));
+                        }
+                        Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
+                    }
                 }
                 if geometry && let Ok(l) = victory_shader::merged::limits(&program) {
                     t.gs_bounded += 1;

@@ -147,9 +147,10 @@ impl<'a> Eval<'a> {
                 Base::Input(reg) if plain(x) => Lin::of(Base::Half { reg, high: true }),
                 _ => opaque,
             },
-            ("v_bfe_u32", [x, off, width]) if c(width) == Some(16) && c(off).is_some_and(|o| o % 16 == 0) => {
+            // (the hardware reads the offset in five bits: 48 is 16)
+            ("v_bfe_u32", [x, off, width]) if c(width) == Some(16) && c(off).is_some_and(|o| (o & 31) % 16 == 0) => {
                 match x.base {
-                    Base::Input(reg) if plain(x) => Lin::of(Base::Half { reg, high: c(off) == Some(16) }),
+                    Base::Input(reg) if plain(x) => Lin::of(Base::Half { reg, high: c(off).map(|o| o & 31) == Some(16) }),
                     _ => opaque,
                 }
             }
@@ -226,22 +227,62 @@ impl EsRecord {
     }
 }
 
+/// Whether an `s_barrier` precedes the handover on every path to it. Fails
+/// unless every path from the entry ends in the handover (`s_setpc_b64`): a
+/// reachable `s_endpgm` is a path whose record never reaches the GS half.
+fn barrier_before_every_handover(p: &Program) -> Result<bool, ShaderError> {
+    let n = p.blocks.len();
+    let mut reachable = vec![false; n];
+    let mut stack = vec![0usize];
+    while let Some(b) = stack.pop() {
+        if !std::mem::replace(&mut reachable[b], true) {
+            stack.extend(p.blocks[b].exit.successors());
+        }
+    }
+    let ends = |b: usize| p.blocks[b].exit == Exit::End;
+    if (0..n).any(|b| reachable[b] && ends(b)) || !(0..n).any(|b| reachable[b] && p.blocks[b].exit == Exit::Indirect) {
+        return Err(unsupported("an ES half that does not hand over to the GS half"));
+    }
+    let has = |b: usize| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier");
+    // Must-analysis: a barrier is behind a block when it is behind every
+    // reachable predecessor (greatest fixed point, the entry has none).
+    let mut behind = vec![true; n];
+    behind[0] = has(0);
+    loop {
+        let mut changed = false;
+        for b in 0..n {
+            if !reachable[b] {
+                continue;
+            }
+            let now = has(b)
+                || b != 0
+                    && (0..n)
+                        .filter(|&q| reachable[q] && p.blocks[q].exit.successors().contains(&b))
+                        .all(|q| behind[q]);
+            if now != behind[b] {
+                behind[b] = now;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok((0..n).all(|b| !(reachable[b] && p.blocks[b].exit == Exit::Indirect) || behind[b]))
+}
+
 /// The records an ES program writes.
 ///
 /// Fails when it does not end by handing over to the GS half
 /// (`s_setpc_b64`), touches LDS in any way but whole-dword record writes,
 /// writes at more than one base, or writes nothing.
 pub fn es_record(p: &Program) -> Result<EsRecord, ShaderError> {
-    if !p.blocks.iter().any(|b| b.exit == Exit::Indirect) {
-        return Err(unsupported("an ES half that does not hand over to the GS half"));
-    }
+    let barrier = barrier_before_every_handover(p)?;
     let eval = Eval::new(p);
     let mut stores = Vec::new();
     let mut at: Option<(Base, u32)> = None;
-    let mut barrier = false;
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
-            barrier |= inst.name() == "s_barrier";
             let Fields::Ds { addr, data, offset0, offset1, gds, .. } = &inst.fields else {
                 continue;
             };
@@ -491,6 +532,62 @@ pub(crate) mod tests {
         assert!(es_record(&program(&bases)).is_err(), "two bases");
         // No record at all.
         assert!(es_record(&program(&[S_BARRIER, S_SETPC])).is_err(), "no write");
+    }
+
+    const S_CMP_EQ_U32_S0_0: u32 = 0xBF06_8000;
+
+    #[test]
+    fn every_reachable_path_has_to_hand_over() {
+        // v_lshlrev, s_cmp_eq_u32 s0, 0, s_cbranch_scc1 over the writes, the
+        // barrier and the handover to a plain end: that path loses the record.
+        let w = es_words();
+        let mut forked = vec![w[0], S_CMP_EQ_U32_S0_0, 0xBF85_0006];
+        forked.extend_from_slice(&w[1..]);
+        forked.push(S_ENDPGM);
+        assert!(es_record(&program(&forked)).is_err(), "a path that ends");
+        // An end nothing reaches does not matter.
+        let mut dead = es_words();
+        dead.push(S_ENDPGM);
+        assert!(es_record(&program(&dead)).is_ok(), "an unreachable end");
+    }
+
+    #[test]
+    fn the_barrier_has_to_be_on_every_path_to_the_handover() {
+        // The branch skips the barrier: one path has none.
+        let w = es_words();
+        let mut skipped = vec![w[0], S_CMP_EQ_U32_S0_0, 0xBF85_0001, S_BARRIER];
+        skipped.extend_from_slice(&w[1..5]);
+        skipped.push(S_SETPC);
+        assert!(!es_record(&program(&skipped)).unwrap().barrier, "a path without it");
+        // A barrier in code nothing reaches is no barrier.
+        let mut dead = es_words();
+        dead.retain(|&x| x != S_BARRIER);
+        dead.extend([S_BARRIER, S_ENDPGM]);
+        assert!(!es_record(&program(&dead)).unwrap().barrier, "an unreachable barrier");
+        assert!(es_record(&program(&es_words())).unwrap().barrier);
+    }
+
+    /// `v_bfe_u32 v3, v0, <offset>, 16`, `v_lshlrev_b32 v3, 2, v3` and a read
+    /// at that address.
+    fn bfe_read(offset: u32) -> Vec<VertexRead> {
+        vertex_reads(&program(&[
+            0xD548_0003,
+            256 | (128 + offset) << 9 | 144 << 18,
+            vop2(V_LSHLREV, 3, 130, 3),
+            ds(DS_READ_B32, 0),
+            ds_regs(3, 0, 4),
+            S_ENDPGM,
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_bit_field_offset_is_read_in_five_bits() {
+        assert_eq!(bfe_read(16)[0].vertex, 1);
+        // 48 is 16 and 32 is 0 for the hardware.
+        assert_eq!(bfe_read(48)[0].vertex, 1);
+        assert_eq!(bfe_read(32)[0].vertex, 0);
+        assert_eq!(bfe_read(0)[0].vertex, 0);
     }
 
     /// The GS half: vertex 0's offset is the low half of v0 (`v_and_b32`
