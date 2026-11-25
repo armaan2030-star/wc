@@ -117,6 +117,12 @@ impl GraphicsState {
                                 "a pipeline enables the depth bounds test, which its host pipeline leaves out: its draws pass at every depth"
                             );
                         }
+                        #[cfg(feature = "diagnostics")]
+                        crate::shader_diag::record(
+                            "depth-bounds-unsupported",
+                            "(graphics state, not yet tied to its shaders)",
+                            "draws pass at every depth; the host pipeline uses the plain description",
+                        );
                     }
                     self.depth = D3D12_DEPTH_STENCIL_DESC {
                         DepthEnable: d.DepthEnable,
@@ -318,6 +324,8 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
         seen.push(reason);
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
     }
+    #[cfg(feature = "diagnostics")]
+    crate::shader_diag::record("state-not-kept", shaders, reason);
     None
 }
 
@@ -492,6 +500,8 @@ impl HostPipeline {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                #[cfg(feature = "diagnostics")]
+                crate::shader_diag::record("root-signature-refused", shaders, &e);
                 return None;
             }
         };
@@ -523,11 +533,15 @@ impl HostPipeline {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    #[cfg(feature = "diagnostics")]
+                    crate::shader_diag::record("pipeline-refused", shaders, &e);
                     host.log_messages();
                     return None;
                 }
             };
             tracing::info!(?shaders, "host pipeline");
+            #[cfg(feature = "diagnostics")]
+            crate::shader_diag::record("ok", shaders, "compute");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
@@ -561,11 +575,15 @@ impl HostPipeline {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    #[cfg(feature = "diagnostics")]
+                    crate::shader_diag::record("mesh-pipeline-refused", shaders, &e);
                     host.log_messages();
                     return None;
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
+            #[cfg(feature = "diagnostics")]
+            crate::shader_diag::record("ok", shaders, format_args!("mesh {state}"));
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
@@ -591,7 +609,11 @@ impl HostPipeline {
             let vs = &stages[0].0.translated()?.host.dxil;
             match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
                 Ok(gs) => rect_gs = Some(gs),
-                Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage");
+                    #[cfg(feature = "diagnostics")]
+                    crate::shader_diag::record("rect-gs-fallback", shaders, &e);
+                }
             }
         }
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
@@ -655,6 +677,12 @@ impl HostPipeline {
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
+            #[cfg(feature = "diagnostics")]
+            crate::shader_diag::record(
+                "rect-gs-fallback",
+                shaders,
+                "host pipeline refused with the rectangle geometry stage; retrying without it",
+            );
             host.log_messages();
             desc.GS = D3D12_SHADER_BYTECODE::default();
             rect_gs = None;
@@ -664,11 +692,15 @@ impl HostPipeline {
             Ok(pso) => pso,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                #[cfg(feature = "diagnostics")]
+                crate::shader_diag::record("pipeline-refused", shaders, &e);
                 host.log_messages();
                 return None;
             }
         };
         tracing::info!(?shaders, "host pipeline");
+        #[cfg(feature = "diagnostics")]
+        crate::shader_diag::record("ok", shaders, format_args!("graphics {state}"));
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,

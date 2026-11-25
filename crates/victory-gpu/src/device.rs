@@ -369,6 +369,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::shader_diag::record(
+        "device-method-unimplemented",
+        "(no shader - a whole creation method, not a shader)",
+        format_args!("slot={SLOT:#x} calls={calls}"),
+    );
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.

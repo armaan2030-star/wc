@@ -46,6 +46,8 @@ pub mod root;
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod shader_diag;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
