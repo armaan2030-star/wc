@@ -74,10 +74,22 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 asked = src_args.Load3(src_at);
+        uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
+        }
+        // Diagnostics, in the budget buffer's words 3-7: the largest group
+        // count asked for in each dimension, the groups of the dispatches
+        // (as bounded), and how many dispatches the bounds changed.
+        uint was;
+        budget.InterlockedMax(12, asked.x, was);
+        budget.InterlockedMax(16, asked.y, was);
+        budget.InterlockedMax(20, asked.z, was);
+        budget.InterlockedAdd(24, g.x * g.y * g.z, was);
+        if (any(g != asked)) {
+            budget.InterlockedAdd(28, 1u, was);
         }
         cost = g.x * g.y * g.z * 64u;
         groups = g;

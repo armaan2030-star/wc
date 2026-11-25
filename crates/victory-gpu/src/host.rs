@@ -4140,7 +4140,19 @@ impl Host {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                // Indirect compute dispatches: the largest group counts asked
+                // for, the groups run, and the dispatches bounded.
+                match runs[i].dispatch_groups() {
+                    Some([x, y, z, run, bounded]) => tracing::warn!(
+                        ms = started.elapsed().as_millis(),
+                        commands,
+                        indirect_groups_asked = format!("{x}x{y}x{z}"),
+                        indirect_groups_run = run,
+                        indirect_bounded = bounded,
+                        "slow host list"
+                    ),
+                    None => tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list"),
+                }
                 for (ms, op) in runs[i].slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
@@ -5077,19 +5089,35 @@ impl HostList {
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all): taken, then zeroed.
+            // asked for, the groups asked in all; compute dispatches: see
+            // `HostList::dispatch_groups`): taken, then zeroed.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                for k in 0..8 {
                     words.add(k).write_volatile(0);
                 }
             })));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// What the argument clamp noted about the indirect compute dispatches
+    /// of the list's last run: the largest group count asked for in x, y
+    /// and z, the groups run (as bounded), and the dispatches the bounds
+    /// changed. Read after the list has run and before it is prepared
+    /// again (the timing run waits for each list on its own). `None` if
+    /// the list has no indirect work.
+    #[cfg(feature = "diagnostics")]
+    fn dispatch_groups(&self) -> Option<[u32; 5]> {
+        let (_, data) = self.budget.get()?.as_ref()?;
+        let words = *data as *const u32;
+        // SAFETY: the list's own mapped words (256 bytes); the card has
+        // finished with them.
+        Some(std::array::from_fn(|k| unsafe { words.add(3 + k).read_volatile() }))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
