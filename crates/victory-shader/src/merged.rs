@@ -86,7 +86,8 @@ pub fn pair_es_gs(es: NativeProgram, gs: NativeProgram) -> Result<MergedGs, Shad
     let mut layout = es.layout.clone();
     for g in &gs.layout {
         let overlaps = |e: &RootParam| {
-            let end = |p: &RootParam| u32::from(p.user_data) + p.sgprs;
+            // (the count is read from the container: no overflow)
+            let end = |p: &RootParam| u32::from(p.user_data).saturating_add(p.sgprs);
             u32::from(e.user_data) < end(g) && u32::from(g.user_data) < end(e)
         };
         // The same table pointer listed by both halves with other ranges (the
@@ -195,6 +196,10 @@ pub fn limits(p: &Program) -> Result<Limits, ShaderError> {
         }
         false
     };
+    // A jump to an address in registers could reach blocks that emit more.
+    if p.blocks.iter().any(|b| matches!(b.exit, Exit::Indirect)) {
+        return Err(unsupported("an unresolved jump in a geometry program"));
+    }
     let mut streams = 0u8;
     let mut cuts = false;
     for (b, block) in p.blocks.iter().enumerate() {
@@ -221,7 +226,9 @@ pub fn limits(p: &Program) -> Result<Limits, ShaderError> {
         }
         on.push(b);
         let after = match p.blocks[b].exit {
-            Exit::End | Exit::Indirect => 0,
+            Exit::End => 0,
+            // (refused below: the jump's target is unknown, so is its bound)
+            Exit::Indirect => 0,
             ref e => {
                 let next: Vec<usize> = e.successors().into_iter().filter(|s| !on.contains(s)).collect();
                 next.into_iter()
@@ -409,6 +416,22 @@ mod tests {
         let es = program(HwStage::Es, vec![range(0, 0)]);
         let gs = program(HwStage::Gs, vec![param(RootType::Constants, 4, 1, 2)]);
         assert!(pair_es_gs(es, gs).is_err());
+    }
+
+    #[test]
+    fn a_huge_sgpr_count_does_not_overflow_the_overlap_test() {
+        let es = program(HwStage::Es, vec![param(RootType::Constants, 200, u32::MAX, 0)]);
+        let gs = program(HwStage::Gs, vec![param(RootType::Constants, 250, 1, 1)]);
+        // They overlap: refused, not wrapped around into "no overlap".
+        assert!(pair_es_gs(es, gs).is_err());
+    }
+
+    #[test]
+    fn a_jump_to_a_register_address_has_no_bound() {
+        // An emit, then s_setpc_b64 s[0:1]: the target could emit more.
+        let r = limits_of(&[send(EMIT), 0xBE80_2000]);
+        assert!(matches!(r, Err(ShaderError::Unsupported { what, .. })
+            if what == "an unresolved jump in a geometry program"), "{r:?}");
     }
 
     #[test]
