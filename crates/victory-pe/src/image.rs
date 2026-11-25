@@ -301,13 +301,16 @@ fn parse_delay_imports(
 }
 
 /// Pairs each name-table entry with its IAT slot. The IAT RVA is not checked
-/// by `object`, so every slot is checked to lie inside the image here.
+/// by `object`, so every slot is checked to be non-zero and inside the image.
 fn entries<'data>(
     mut thunks: ImportThunkList<'data>,
     iat_rva: u32,
     size_of_image: u32,
     import: impl Fn(pe::ImageThunkData64) -> object::read::Result<Import<'data>>,
 ) -> Result<Vec<ImportEntry>, PeError> {
+    if iat_rva == 0 {
+        return Err(PeError::Malformed("IAT RVA is 0".into()));
+    }
     let mut entries = Vec::new();
     while let Some(thunk) = thunks.next::<ImageNtHeaders64>()? {
         let iat_slot_rva = u32::try_from(entries.len() * 8)
@@ -468,6 +471,22 @@ mod tests {
             .unwrap() as usize;
         // First descriptor's FirstThunk, at the 4 GiB limit: used to overflow.
         data[desc + 16..desc + 20].copy_from_slice(&0xFFFF_FFF8u32.to_le_bytes());
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_iat_rva() {
+        let mut data = own_image();
+        let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
+        let import_rva = layout::read_u32(&data, dd).unwrap();
+        let desc = ImageInfo::parse(&data)
+            .unwrap()
+            .rva_to_file_offset(import_rva)
+            .unwrap() as usize;
+        data[desc + 16..desc + 20].copy_from_slice(&0u32.to_le_bytes());
         assert!(matches!(
             ImageInfo::parse(&data),
             Err(PeError::Malformed(_))
